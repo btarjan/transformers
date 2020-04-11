@@ -17,7 +17,7 @@
   "mem_len": null,
   "n_head": 12,
   "n_layer": 12,
-  "n_token": 30000,
+  "n_token": 32000,
   "num_labels": 2,
   "output_attentions": false,
   "output_hidden_states": false,
