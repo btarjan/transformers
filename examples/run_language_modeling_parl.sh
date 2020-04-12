@@ -19,7 +19,7 @@
 ##Train Roberta with EsperBERTo config on CC data
 #################################################
 
-export TRAIN_FILE=datasets/cc/cc_train_6-0_no-symbols.txt
+export TRAIN_FILE=datasets/mtva/MTVA-parlament_8-0_for_CC.txt
 export TEST_FILE=datasets/cc/cc_dev_6-0_no-symbols.txt
 
 #python run_language_modeling.py \
@@ -60,8 +60,8 @@ export TEST_FILE=datasets/cc/cc_dev_6-0_no-symbols.txt
 ##Train GPT-2 with gpt2(small) config on CC data
 ################################################
 
-export TRAIN_FILE=datasets/cc/cc_train_6-0_no-symbols.txt
-export TEST_FILE=datasets/cc/cc_dev_6-0_no-symbols.txt
+export TRAIN_FILE=datasets/mtva/MTVA-parlament_8-0_for_CC.txt
+#export TEST_FILE=datasets/mtva/MTVA-parlament_8-0_for_CC_dev.txt
 
 #python run_language_modeling.py \
 #    --output_dir ./models/cc-gpt2-v1 \
@@ -115,22 +115,23 @@ export TEST_FILE=datasets/cc/cc_dev_6-0_no-symbols.txt
 #    --seed 42 \
 #    --learning_rate 1e-4
 
-#python run_language_modeling.py \
-#    --output_dir ./models/cc-gpt2-v4-2GPU2 \
-#    --model_type gpt2 \
-#    --config_name ./models/gpt2 \
-#    --tokenizer_name ./models/cc-ByteLevelBPE-gpt2 \
-#    --do_train \
-#    --train_data_file=$TRAIN_FILE \
-#    --do_eval \
-#    --eval_data_file=$TEST_FILE \
-#    --num_train_epochs 15 \
-#    --save_total_limit 2 \
-#    --save_steps 2000 \
-#    --per_gpu_train_batch_size 4 \
-#    --evaluate_during_training \
-#    --seed 42 \
-#    --learning_rate 1e-4
+python run_language_modeling.py \
+    --output_dir ./models/parl-gpt2-v1 \
+    --model_type gpt2 \
+    --config_name ./models/gpt2 \
+    --tokenizer_name ./models/cc-ByteLevelBPE-gpt2 \
+    --do_train \
+    --train_data_file=$TRAIN_FILE \
+    --do_eval \
+    --eval_data_file=$TEST_FILE \
+    --num_train_epochs 10 \
+    --save_total_limit 2 \
+    --logging_steps 500 \
+    --save_steps 2000 \
+    --per_gpu_train_batch_size 4 \
+    --evaluate_during_training \
+    --seed 42 \
+    --learning_rate 1e-4
 
 #python run_language_modeling.py \
 #    --output_dir ./models/cc-gpt2-v6 \
@@ -166,43 +167,43 @@ export TEST_FILE=datasets/cc/cc_dev_6-0_no-symbols.txt
 #    --seed 42 \
 #    --learning_rate 1e-4
 
-for i in 6 8 10 12; do
-python run_language_modeling.py \
-    --output_dir ./models/cc-gpt2-lr_3e4-epoch_${i}-2GPU \
-    --model_type gpt2 \
-    --config_name ./models/gpt2 \
-    --tokenizer_name ./models/cc-ByteLevelBPE-gpt2 \
-    --do_train \
-    --train_data_file=$TRAIN_FILE \
-    --do_eval \
-    --eval_data_file=$TEST_FILE \
-    --num_train_epochs ${i} \
-    --save_total_limit 2 \
-    --save_steps 2000 \
-    --per_gpu_train_batch_size 4 \
-    --evaluate_during_training \
-    --seed 42 \
-    --learning_rate 3e-4
-done
-
-for i in 6 8 10 12; do
-python run_language_modeling.py \
-    --output_dir ./models/cc-gpt2-lr_4e4-epoch_${i}-2GPU \
-    --model_type gpt2 \
-    --config_name ./models/gpt2 \
-    --tokenizer_name ./models/cc-ByteLevelBPE-gpt2 \
-    --do_train \
-    --train_data_file=$TRAIN_FILE \
-    --do_eval \
-    --eval_data_file=$TEST_FILE \
-    --num_train_epochs ${i} \
-    --save_total_limit 2 \
-    --save_steps 2000 \
-    --per_gpu_train_batch_size 4 \
-    --evaluate_during_training \
-    --seed 42 \
-    --learning_rate 4e-4
-done
+#for i in 6 8 10 12; do
+#python run_language_modeling.py \
+#    --output_dir ./models/cc-gpt2-lr_3e4-epoch_${i}-2GPU \
+#    --model_type gpt2 \
+#    --config_name ./models/gpt2 \
+#    --tokenizer_name ./models/cc-ByteLevelBPE-gpt2 \
+#    --do_train \
+#    --train_data_file=$TRAIN_FILE \
+#    --do_eval \
+#    --eval_data_file=$TEST_FILE \
+#    --num_train_epochs ${i} \
+#    --save_total_limit 2 \
+#    --save_steps 2000 \
+#    --per_gpu_train_batch_size 4 \
+#    --evaluate_during_training \
+#    --seed 42 \
+#    --learning_rate 3e-4
+#done
+#
+#for i in 6 8 10 12; do
+#python run_language_modeling.py \
+#    --output_dir ./models/cc-gpt2-lr_4e4-epoch_${i}-2GPU \
+#    --model_type gpt2 \
+#    --config_name ./models/gpt2 \
+#    --tokenizer_name ./models/cc-ByteLevelBPE-gpt2 \
+#    --do_train \
+#    --train_data_file=$TRAIN_FILE \
+#    --do_eval \
+#    --eval_data_file=$TEST_FILE \
+#    --num_train_epochs ${i} \
+#    --save_total_limit 2 \
+#    --save_steps 2000 \
+#    --per_gpu_train_batch_size 4 \
+#    --evaluate_during_training \
+#    --seed 42 \
+#    --learning_rate 4e-4
+#done
 
 
 
