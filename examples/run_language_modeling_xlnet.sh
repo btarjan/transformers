@@ -75,8 +75,8 @@ python run_language_modeling.py \
     --num_train_epochs 20 \
     --save_total_limit 2 \
     --save_steps 2000 \
-    --per_gpu_train_batch_size 1 \
-    --block_size=512 \
+    --block_size 512 \
+    --per_gpu_train_batch_size 2 \
     --evaluate_during_training \
     --seed 42 \
     --learning_rate 1e-4
