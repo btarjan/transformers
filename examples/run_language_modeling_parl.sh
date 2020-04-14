@@ -9,21 +9,39 @@ export TEST_FILE=datasets/cc/cc_dev_6-0_no-symbols.txt
 export TRAIN_FILE=datasets/mtva/MTVA-parlament_8-0_for_CC.txt
 #export TEST_FILE=datasets/mtva/MTVA-parlament_8-0_for_CC_dev.txt
 
+#python run_language_modeling.py \
+#    --output_dir ./models/parl-gpt2-v3 \
+#    --model_type gpt2 \
+#    --config_name ./models/gpt2 \
+#    --tokenizer_name ./models/cc-ByteLevelBPE-gpt2 \
+#    --do_train \
+#    --train_data_file=$TRAIN_FILE \
+#    --do_eval \
+#    --eval_data_file=$TEST_FILE \
+#    --num_train_epochs 5 \
+#    --save_total_limit 2 \
+#    --logging_steps 500 \
+#    --save_steps 2000 \
+#    --per_gpu_train_batch_size 4 \
+#    --evaluate_during_training \
+#    --seed 42 \
+#    --learning_rate 1e-4
+
 python run_language_modeling.py \
-    --output_dir ./models/parl-gpt2-v3 \
+    --output_dir ./models/parl-gpt2-medium-v1 \
     --model_type gpt2 \
-    --config_name ./models/gpt2 \
+    --config_name ./models/gpt2-medium \
     --tokenizer_name ./models/cc-ByteLevelBPE-gpt2 \
     --do_train \
     --train_data_file=$TRAIN_FILE \
     --do_eval \
     --eval_data_file=$TEST_FILE \
-    --num_train_epochs 5 \
-    --save_total_limit 2 \
-    --logging_steps 500 \
-    --save_steps 2000 \
-    --per_gpu_train_batch_size 4 \
+    --num_train_epochs 10 \
+    --logging_steps 2000 \
+    --save_steps 20000 \
+    --per_gpu_train_batch_size 1 \
     --evaluate_during_training \
+    --eval_all_checkpoints \
     --seed 42 \
-    --learning_rate 3e-4
+    --learning_rate 1e-4
 

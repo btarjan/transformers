@@ -14,6 +14,6 @@ for i in {1..30000}; do
         --prompt="${PROMPT}" \
         --seed=${i} \
         --num_return_sequences=90 \
-        --model_name_or_path=models/cc-gpt2-v4
+        --model_name_or_path=models/parl-gpt2-v1_finetune_cc_v1_epoch-4
 done
 
