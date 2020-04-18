@@ -115,8 +115,9 @@ export TEST_FILE=datasets/cc/cc_dev_6-0_no-symbols.txt
 #    --seed 42 \
 #    --learning_rate 1e-4
 
+for i in 1 4 16 64 256; do
 python run_language_modeling.py \
-    --output_dir ./models/cc-gpt2-v4-test \
+    --output_dir ./models/cc-gpt2-v4-grad_acc_${i} \
     --model_type gpt2 \
     --config_name ./models/gpt2 \
     --tokenizer_name ./models/cc-ByteLevelBPE-gpt2 \
@@ -124,13 +125,15 @@ python run_language_modeling.py \
     --train_data_file=$TRAIN_FILE \
     --do_eval \
     --eval_data_file=$TEST_FILE \
-    --num_train_epochs 15 \
+    --num_train_epochs 10 \
     --save_total_limit 2 \
     --save_steps 2000 \
-    --per_gpu_train_batch_size 4 \
+    --per_gpu_train_batch_size 2 \
     --evaluate_during_training \
     --seed 42 \
-    --learning_rate 1e-4
+    --learning_rate 1e-4 \
+    --gradient_accumulation_steps ${i}
+done
 
 #python run_language_modeling.py \
 #    --output_dir ./models/cc-gpt2-v6 \
