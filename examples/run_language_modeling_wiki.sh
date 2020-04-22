@@ -2,7 +2,7 @@
 export TRAIN_FILE=datasets/wiki-hu/wiki-hu.txt
 export TEST_FILE=datasets/cc/cc_dev_6-0_no-symbols.txt
 
-BATCH_SIZE=8
+BATCH_SIZE=4
 GRAD_ACC=1
 
 python run_language_modeling.py \
