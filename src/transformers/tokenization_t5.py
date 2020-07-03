@@ -94,6 +94,7 @@ class T5Tokenizer(PreTrainedTokenizer):
     vocab_files_names = VOCAB_FILES_NAMES
     pretrained_vocab_files_map = PRETRAINED_VOCAB_FILES_MAP
     max_model_input_sizes = PRETRAINED_POSITIONAL_EMBEDDINGS_SIZES
+    model_input_names = ["attention_mask"]
 
     def __init__(
         self,
@@ -118,12 +119,6 @@ class T5Tokenizer(PreTrainedTokenizer):
             additional_special_tokens=additional_special_tokens,
             **kwargs,
         )
-        self.max_len_single_sentence = (
-            self.max_len
-        )  # no default special tokens - you can update this value if you add special tokens
-        self.max_len_sentences_pair = (
-            self.max_len
-        )  # no default special tokens - you can update this value if you add special tokens
 
         try:
             import sentencepiece as spm
