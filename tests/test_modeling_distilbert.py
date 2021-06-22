@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2018 The Google AI Language Team Authors.
+# Copyright 2020 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,19 +20,21 @@ from transformers import is_torch_available
 from transformers.testing_utils import require_torch, slow, torch_device
 
 from .test_configuration_common import ConfigTester
-from .test_modeling_common import ModelTesterMixin, ids_tensor
+from .test_modeling_common import ModelTesterMixin, ids_tensor, random_attention_mask
 
 
 if is_torch_available():
+    import torch
+
     from transformers import (
+        DISTILBERT_PRETRAINED_MODEL_ARCHIVE_LIST,
         DistilBertConfig,
-        DistilBertModel,
         DistilBertForMaskedLM,
         DistilBertForMultipleChoice,
-        DistilBertForTokenClassification,
         DistilBertForQuestionAnswering,
         DistilBertForSequenceClassification,
-        DISTILBERT_PRETRAINED_MODEL_ARCHIVE_LIST,
+        DistilBertForTokenClassification,
+        DistilBertModel,
     )
 
     class DistilBertModelTester(object):
@@ -89,7 +91,7 @@ if is_torch_available():
 
             input_mask = None
             if self.use_input_mask:
-                input_mask = ids_tensor([self.batch_size, self.seq_length], vocab_size=2)
+                input_mask = random_attention_mask([self.batch_size, self.seq_length])
 
             sequence_labels = None
             token_labels = None
@@ -110,7 +112,6 @@ if is_torch_available():
                 attention_dropout=self.attention_probs_dropout_prob,
                 max_position_embeddings=self.max_position_embeddings,
                 initializer_range=self.initializer_range,
-                return_dict=True,
             )
 
             return config, input_ids, input_mask, sequence_labels, token_labels, choice_labels
@@ -179,7 +180,9 @@ if is_torch_available():
             multiple_choice_inputs_ids = input_ids.unsqueeze(1).expand(-1, self.num_choices, -1).contiguous()
             multiple_choice_input_mask = input_mask.unsqueeze(1).expand(-1, self.num_choices, -1).contiguous()
             result = model(
-                multiple_choice_inputs_ids, attention_mask=multiple_choice_input_mask, labels=choice_labels,
+                multiple_choice_inputs_ids,
+                attention_mask=multiple_choice_input_mask,
+                labels=choice_labels,
             )
             self.parent.assertEqual(result.logits.shape, (self.batch_size, self.num_choices))
 
@@ -205,10 +208,11 @@ class DistilBertModelTest(ModelTesterMixin, unittest.TestCase):
         if is_torch_available()
         else None
     )
+    fx_ready_model_classes = all_model_classes
     test_pruning = True
     test_torchscript = True
     test_resize_embeddings = True
-    test_head_masking = True
+    test_sequence_classification_problem_types = True
 
     def setUp(self):
         self.model_tester = DistilBertModelTester(self)
@@ -246,3 +250,20 @@ class DistilBertModelTest(ModelTesterMixin, unittest.TestCase):
         for model_name in DISTILBERT_PRETRAINED_MODEL_ARCHIVE_LIST[:1]:
             model = DistilBertModel.from_pretrained(model_name)
             self.assertIsNotNone(model)
+
+
+@require_torch
+class DistilBertModelIntergrationTest(unittest.TestCase):
+    @slow
+    def test_inference_no_head_absolute_embedding(self):
+        model = DistilBertModel.from_pretrained("distilbert-base-uncased")
+        input_ids = torch.tensor([[0, 345, 232, 328, 740, 140, 1695, 69, 6078, 1588, 2]])
+        attention_mask = torch.tensor([[0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]])
+        output = model(input_ids, attention_mask=attention_mask)[0]
+        expected_shape = torch.Size((1, 11, 768))
+        self.assertEqual(output.shape, expected_shape)
+        expected_slice = torch.tensor(
+            [[[-0.1639, 0.3299, 0.1648], [-0.1746, 0.3289, 0.1710], [-0.1884, 0.3357, 0.1810]]]
+        )
+
+        self.assertTrue(torch.allclose(output[:, 1:4, 1:4], expected_slice, atol=1e-4))

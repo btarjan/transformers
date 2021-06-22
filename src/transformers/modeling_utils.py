@@ -15,35 +15,59 @@
 # limitations under the License.
 
 import inspect
-import logging
 import os
 import re
+import warnings
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 import torch
 from torch import Tensor, device, dtype, nn
 from torch.nn import CrossEntropyLoss
-from torch.nn import functional as F
 
 from .activations import get_activation
 from .configuration_utils import PretrainedConfig
+from .deepspeed import deepspeed_config, is_deepspeed_zero3_enabled
 from .file_utils import (
+    CONFIG_NAME,
     DUMMY_INPUTS,
+    FLAX_WEIGHTS_NAME,
     TF2_WEIGHTS_NAME,
     TF_WEIGHTS_NAME,
     WEIGHTS_NAME,
     ModelOutput,
+    PushToHubMixin,
     cached_path,
     hf_bucket_url,
+    is_offline_mode,
     is_remote_url,
-    is_torch_tpu_available,
     replace_return_docstrings,
 )
 from .generation_utils import GenerationMixin
+from .utils import logging
 
 
-logger = logging.getLogger(__name__)
+logger = logging.get_logger(__name__)
+
+
+_init_weights = True
+
+
+@contextmanager
+def no_init_weights(_enable=True):
+    """
+    Context manager to globally disable weight initialization to speed up loading large models.
+
+    TODO(Patrick): Delete safety argument `_enable=True` at next major version. .
+    """
+    global _init_weights
+    if _enable:
+        _init_weights = False
+    try:
+        yield
+    finally:
+        _init_weights = True
 
 
 try:
@@ -51,8 +75,7 @@ try:
 except ImportError:
     # Older PyTorch compatibility
     class Identity(nn.Module):
-        r"""A placeholder identity operator that is argument-insensitive.
-        """
+        r"""A placeholder identity operator that is argument-insensitive."""
 
         def __init__(self, *args, **kwargs):
             super().__init__()
@@ -87,24 +110,40 @@ def find_pruneable_heads_and_indices(
     return heads, index
 
 
+def get_parameter_device(parameter: Union[nn.Module, GenerationMixin, "ModuleUtilsMixin"]):
+    try:
+        return next(parameter.parameters()).device
+    except StopIteration:
+        # For nn.DataParallel compatibility in PyTorch 1.5
+
+        def find_tensor_attributes(module: nn.Module) -> List[Tuple[str, Tensor]]:
+            tuples = [(k, v) for k, v in module.__dict__.items() if torch.is_tensor(v)]
+            return tuples
+
+        gen = parameter._named_members(get_members_fn=find_tensor_attributes)
+        first_tuple = next(gen)
+        return first_tuple[1].device
+
+
+def get_parameter_dtype(parameter: Union[nn.Module, GenerationMixin, "ModuleUtilsMixin"]):
+    try:
+        return next(parameter.parameters()).dtype
+    except StopIteration:
+        # For nn.DataParallel compatibility in PyTorch 1.5
+
+        def find_tensor_attributes(module: nn.Module) -> List[Tuple[str, Tensor]]:
+            tuples = [(k, v) for k, v in module.__dict__.items() if torch.is_tensor(v)]
+            return tuples
+
+        gen = parameter._named_members(get_members_fn=find_tensor_attributes)
+        first_tuple = next(gen)
+        return first_tuple[1].dtype
+
+
 class ModuleUtilsMixin:
     """
     A few utilities for :obj:`torch.nn.Modules`, to be used as a mixin.
     """
-
-    def num_parameters(self, only_trainable: bool = False) -> int:
-        """
-        Get the number of (optionally, trainable) parameters in the model.
-
-        Args:
-            only_trainable (:obj:`bool`, `optional`, defaults to :obj:`False`):
-                Whether or not to return only the number of trainable parameters
-
-        Returns:
-            :obj:`int`: The number of parameters.
-        """
-        params = filter(lambda x: x.requires_grad, self.parameters()) if only_trainable else self.parameters()
-        return sum(p.numel() for p in params)
 
     @staticmethod
     def _hook_rss_memory_pre_forward(module, *args, **kwargs):
@@ -160,36 +199,14 @@ class ModuleUtilsMixin:
         :obj:`torch.device`: The device on which the module is (assuming that all the module parameters are on the same
         device).
         """
-        try:
-            return next(self.parameters()).device
-        except StopIteration:
-            # For nn.DataParallel compatibility in PyTorch 1.5
-
-            def find_tensor_attributes(module: nn.Module) -> List[Tuple[str, Tensor]]:
-                tuples = [(k, v) for k, v in module.__dict__.items() if torch.is_tensor(v)]
-                return tuples
-
-            gen = self._named_members(get_members_fn=find_tensor_attributes)
-            first_tuple = next(gen)
-            return first_tuple[1].device
+        return get_parameter_device(self)
 
     @property
     def dtype(self) -> dtype:
         """
         :obj:`torch.dtype`: The dtype of the module (assuming that all the module parameters have the same dtype).
         """
-        try:
-            return next(self.parameters()).dtype
-        except StopIteration:
-            # For nn.DataParallel compatibility in PyTorch 1.5
-
-            def find_tensor_attributes(module: nn.Module) -> List[Tuple[str, Tensor]]:
-                tuples = [(k, v) for k, v in module.__dict__.items() if torch.is_tensor(v)]
-                return tuples
-
-            gen = self._named_members(get_members_fn=find_tensor_attributes)
-            first_tuple = next(gen)
-            return first_tuple[1].dtype
+        return get_parameter_dtype(self)
 
     def invert_attention_mask(self, encoder_attention_mask: Tensor) -> Tensor:
         """
@@ -218,9 +235,7 @@ class ModuleUtilsMixin:
             encoder_extended_attention_mask = (1.0 - encoder_extended_attention_mask) * -1e9
         else:
             raise ValueError(
-                "{} not recognized. `dtype` should be set to either `torch.float32` or `torch.float16`".format(
-                    self.dtype
-                )
+                f"{self.dtype} not recognized. `dtype` should be set to either `torch.float32` or `torch.float16`"
             )
 
         return encoder_extended_attention_mask
@@ -252,16 +267,28 @@ class ModuleUtilsMixin:
                 batch_size, seq_length = input_shape
                 seq_ids = torch.arange(seq_length, device=device)
                 causal_mask = seq_ids[None, None, :].repeat(batch_size, seq_length, 1) <= seq_ids[None, :, None]
+                # in case past_key_values are used we need to add a prefix ones mask to the causal mask
                 # causal and attention masks must have same type with pytorch version < 1.3
                 causal_mask = causal_mask.to(attention_mask.dtype)
+
+                if causal_mask.shape[1] < attention_mask.shape[1]:
+                    prefix_seq_len = attention_mask.shape[1] - causal_mask.shape[1]
+                    causal_mask = torch.cat(
+                        [
+                            torch.ones(
+                                (batch_size, seq_length, prefix_seq_len), device=device, dtype=causal_mask.dtype
+                            ),
+                            causal_mask,
+                        ],
+                        axis=-1,
+                    )
+
                 extended_attention_mask = causal_mask[:, None, :, :] * attention_mask[:, None, None, :]
             else:
                 extended_attention_mask = attention_mask[:, None, None, :]
         else:
             raise ValueError(
-                "Wrong shape for input_ids (shape {}) or attention_mask (shape {})".format(
-                    input_shape, attention_mask.shape
-                )
+                f"Wrong shape for input_ids (shape {input_shape}) or attention_mask (shape {attention_mask.shape})"
             )
 
         # Since attention_mask is 1.0 for positions we want to attend and 0.0 for
@@ -284,12 +311,12 @@ class ModuleUtilsMixin:
                 The mask indicating if we should keep the heads or not (1.0 for keep, 0.0 for discard).
             num_hidden_layers (:obj:`int`):
                 The number of hidden layers in the model.
-            is_attention_chunked: (:obj:`bool`, `optional, defaults to :obj:`False`):
+            is_attention_chunked: (:obj:`bool`, `optional`, defaults to :obj:`False`):
                 Whether or not the attentions scores are computed by chunks or not.
 
         Returns:
-            :obj:`torch.Tensor` with shape :obj:`[num_hidden_layers x batch x num_heads x seq_length x seq_length]`
-            or list with :obj:`[None]` for each layer.
+            :obj:`torch.Tensor` with shape :obj:`[num_hidden_layers x batch x num_heads x seq_length x seq_length]` or
+            list with :obj:`[None]` for each layer.
         """
         if head_mask is not None:
             head_mask = self._convert_head_mask_to_5d(head_mask, num_hidden_layers)
@@ -308,11 +335,77 @@ class ModuleUtilsMixin:
         elif head_mask.dim() == 2:
             head_mask = head_mask.unsqueeze(1).unsqueeze(-1).unsqueeze(-1)  # We can specify head_mask for each layer
         assert head_mask.dim() == 5, f"head_mask.dim != 5, instead {head_mask.dim()}"
-        head_mask = head_mask.to(dtype=self.dtype)  # switch to fload if need + fp16 compatibility
+        head_mask = head_mask.to(dtype=self.dtype)  # switch to float if need + fp16 compatibility
         return head_mask
 
+    def num_parameters(self, only_trainable: bool = False, exclude_embeddings: bool = False) -> int:
+        """
+        Get number of (optionally, trainable or non-embeddings) parameters in the module.
 
-class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin):
+        Args:
+            only_trainable (:obj:`bool`, `optional`, defaults to :obj:`False`):
+                Whether or not to return only the number of trainable parameters
+
+            exclude_embeddings (:obj:`bool`, `optional`, defaults to :obj:`False`):
+                Whether or not to return only the number of non-embeddings parameters
+
+        Returns:
+            :obj:`int`: The number of parameters.
+        """
+
+        def parameter_filter(x):
+            return (x.requires_grad or not only_trainable) and not (isinstance(x, nn.Embedding) and exclude_embeddings)
+
+        params = filter(parameter_filter, self.parameters()) if only_trainable else self.parameters()
+        return sum(p.numel() for p in params)
+
+    def estimate_tokens(self, input_dict: Dict[str, Union[torch.Tensor, Any]]) -> int:
+        """
+        Helper function to estimate the total number of tokens from the model inputs.
+
+        Args:
+            inputs (:obj:`dict`): The model inputs.
+
+        Returns:
+            :obj:`int`: The total number of tokens.
+        """
+        token_inputs = [tensor for key, tensor in input_dict.items() if "input" in key]
+        if token_inputs:
+            return sum([token_input.numel() for token_input in token_inputs])
+        else:
+            warnings.warn(
+                "Could not estimate the number of tokens of the input, floating-point operations will not be computed"
+            )
+            return 0
+
+    def floating_point_ops(
+        self, input_dict: Dict[str, Union[torch.Tensor, Any]], exclude_embeddings: bool = True
+    ) -> int:
+        """
+        Get number of (optionally, non-embeddings) floating-point operations for the forward and backward passes of a
+        batch with this transformer model. Default approximation neglects the quadratic dependency on the number of
+        tokens (valid if :obj:`12 * d_model << sequence_length`) as laid out in `this paper
+        <https://arxiv.org/pdf/2001.08361.pdf>`__ section 2.1. Should be overridden for transformers with parameter
+        re-use e.g. Albert or Universal Transformers, or if doing long-range modeling with very high sequence lengths.
+
+        Args:
+            batch_size (:obj:`int`):
+                The batch size for the forward pass.
+
+            sequence_length (:obj:`int`):
+                The number of tokens in each line of the batch.
+
+            exclude_embeddings (:obj:`bool`, `optional`, defaults to :obj:`True`):
+                Whether or not to count embedding and softmax operations.
+
+        Returns:
+            :obj:`int`: The number of floating-point operations.
+        """
+
+        return 6 * self.estimate_tokens(input_dict) * self.num_parameters(exclude_embeddings=exclude_embeddings)
+
+
+class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin, PushToHubMixin):
     r"""
     Base class for all models.
 
@@ -323,25 +416,35 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin):
         * prune heads in the self-attention heads.
 
     Class attributes (overridden by derived classes):
+
         - **config_class** (:class:`~transformers.PretrainedConfig`) -- A subclass of
           :class:`~transformers.PretrainedConfig` to use as configuration class for this model architecture.
-        - **load_tf_weights** (:obj:`Callable`) -- A python `method` for loading a TensorFlow checkpoint in a
-          PyTorch model, taking as arguments:
+        - **load_tf_weights** (:obj:`Callable`) -- A python `method` for loading a TensorFlow checkpoint in a PyTorch
+          model, taking as arguments:
 
             - **model** (:class:`~transformers.PreTrainedModel`) -- An instance of the model on which to load the
               TensorFlow checkpoint.
-            - **config** (:class:`~transformers.PreTrainedConfig`) -- An instance of the configuration associated
-              to the model.
+            - **config** (:class:`~transformers.PreTrainedConfig`) -- An instance of the configuration associated to
+              the model.
             - **path** (:obj:`str`) -- A path to the TensorFlow checkpoint.
 
         - **base_model_prefix** (:obj:`str`) -- A string indicating the attribute associated to the base model in
           derived classes of the same architecture adding modules on top of the base model.
-        - **authorized_missing_keys** (:obj:`Optional[List[str]]`) -- A list of re pattern of tensor names to ignore
-          when loading the model (and avoid unnecessary warnings).
+        - **is_parallelizable** (:obj:`bool`) -- A flag indicating whether this model supports model parallelization.
     """
     config_class = None
     base_model_prefix = ""
-    authorized_missing_keys = None
+    # a list of re pattern of tensor names to ignore from the model when loading the model weights
+    # (and avoid unnecessary warnings).
+    _keys_to_ignore_on_load_missing = None
+    # a list of re pattern of tensor names to ignore from the weights when loading the model weights
+    # (and avoid unnecessary warnings).
+    _keys_to_ignore_on_load_unexpected = None
+    # a list of of tensor names to ignore when saving the model (useful for keys that aren't
+    # trained, but which are deterministic)
+    _keys_to_ignore_on_save = None
+
+    is_parallelizable = False
 
     @property
     def dummy_inputs(self) -> Dict[str, torch.Tensor]:
@@ -354,14 +457,13 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin):
         super().__init__()
         if not isinstance(config, PretrainedConfig):
             raise ValueError(
-                "Parameter config in `{}(config)` should be an instance of class `PretrainedConfig`. "
-                "To create a model from a pretrained model use "
-                "`model = {}.from_pretrained(PRETRAINED_MODEL_NAME)`".format(
-                    self.__class__.__name__, self.__class__.__name__
-                )
+                f"Parameter config in `{self.__class__.__name__}(config)` should be an instance of class "
+                "`PretrainedConfig`. To create a model from a pretrained model use "
+                f"`model = {self.__class__.__name__}.from_pretrained(PRETRAINED_MODEL_NAME)`"
             )
-        # Save config in model
+        # Save config and origin of the pretrained weights if given in model
         self.config = config
+        self.name_or_path = config.name_or_path
 
     @property
     def base_model(self) -> nn.Module:
@@ -385,7 +487,7 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin):
 
     def set_input_embeddings(self, value: nn.Module):
         """
-        Set model's input embeddings
+        Set model's input embeddings.
 
         Args:
             value (:obj:`nn.Module`): A module mapping vocabulary to hidden states.
@@ -405,6 +507,12 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin):
         """
         return None  # Overwrite for models with output embeddings
 
+    def _init_weights(self, module):
+        """
+        Initialize the weights. This method should be overridden by derived class.
+        """
+        raise NotImplementedError(f"Make sure `_init_weigths` is implemented for {self.__class__}")
+
     def tie_weights(self):
         """
         Tie the weights between the input embeddings and the output embeddings.
@@ -413,28 +521,108 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin):
         the weights instead.
         """
         output_embeddings = self.get_output_embeddings()
-        if output_embeddings is not None:
+        if output_embeddings is not None and self.config.tie_word_embeddings:
             self._tie_or_clone_weights(output_embeddings, self.get_input_embeddings())
 
+        if self.config.is_encoder_decoder and self.config.tie_encoder_decoder:
+            if hasattr(self, self.base_model_prefix):
+                self = getattr(self, self.base_model_prefix)
+            self._tie_encoder_decoder_weights(self.encoder, self.decoder, self.base_model_prefix)
+
+    @staticmethod
+    def _tie_encoder_decoder_weights(encoder: nn.Module, decoder: nn.Module, base_model_prefix: str):
+        uninitialized_encoder_weights: List[str] = []
+        if decoder.__class__ != encoder.__class__:
+            logger.info(
+                f"{decoder.__class__} and {encoder.__class__} are not equal. In this case make sure that all encoder weights are correctly initialized."
+            )
+
+        def tie_encoder_to_decoder_recursively(
+            decoder_pointer: nn.Module,
+            encoder_pointer: nn.Module,
+            module_name: str,
+            uninitialized_encoder_weights: List[str],
+            depth=0,
+        ):
+            assert isinstance(decoder_pointer, nn.Module) and isinstance(
+                encoder_pointer, nn.Module
+            ), f"{decoder_pointer} and {encoder_pointer} have to be of type nn.Module"
+            if hasattr(decoder_pointer, "weight"):
+                assert hasattr(encoder_pointer, "weight")
+                encoder_pointer.weight = decoder_pointer.weight
+                if hasattr(decoder_pointer, "bias"):
+                    assert hasattr(encoder_pointer, "bias")
+                    encoder_pointer.bias = decoder_pointer.bias
+                return
+
+            encoder_modules = encoder_pointer._modules
+            decoder_modules = decoder_pointer._modules
+            if len(decoder_modules) > 0:
+                assert (
+                    len(encoder_modules) > 0
+                ), f"Encoder module {encoder_pointer} does not match decoder module {decoder_pointer}"
+
+                all_encoder_weights = set([module_name + "/" + sub_name for sub_name in encoder_modules.keys()])
+                encoder_layer_pos = 0
+                for name, module in decoder_modules.items():
+                    if name.isdigit():
+                        encoder_name = str(int(name) + encoder_layer_pos)
+                        decoder_name = name
+                        if not isinstance(decoder_modules[decoder_name], type(encoder_modules[encoder_name])) and len(
+                            encoder_modules
+                        ) != len(decoder_modules):
+                            # this can happen if the name corresponds to the position in a list module list of layers
+                            # in this case the decoder has added a cross-attention that the encoder does not have
+                            # thus skip this step and subtract one layer pos from encoder
+                            encoder_layer_pos -= 1
+                            continue
+                    elif name not in encoder_modules:
+                        continue
+                    elif depth > 500:
+                        raise ValueError(
+                            "Max depth of recursive function `tie_encoder_to_decoder` reached. It seems that there is a circular dependency between two or more `nn.Modules` of your model."
+                        )
+                    else:
+                        decoder_name = encoder_name = name
+                    tie_encoder_to_decoder_recursively(
+                        decoder_modules[decoder_name],
+                        encoder_modules[encoder_name],
+                        module_name + "/" + name,
+                        uninitialized_encoder_weights,
+                        depth=depth + 1,
+                    )
+                    all_encoder_weights.remove(module_name + "/" + encoder_name)
+
+                uninitialized_encoder_weights += list(all_encoder_weights)
+
+        # tie weights recursively
+        tie_encoder_to_decoder_recursively(decoder, encoder, base_model_prefix, uninitialized_encoder_weights)
+        if len(uninitialized_encoder_weights) > 0:
+            logger.warning(
+                f"The following encoder weights were not tied to the decoder {uninitialized_encoder_weights}"
+            )
+
     def _tie_or_clone_weights(self, output_embeddings, input_embeddings):
-        """ Tie or clone module weights depending of whether we are using TorchScript or not
-        """
+        """Tie or clone module weights depending of whether we are using TorchScript or not"""
         if self.config.torchscript:
             output_embeddings.weight = nn.Parameter(input_embeddings.weight.clone())
         else:
             output_embeddings.weight = input_embeddings.weight
 
         if getattr(output_embeddings, "bias", None) is not None:
-            output_embeddings.bias.data = torch.nn.functional.pad(
+            output_embeddings.bias.data = nn.functional.pad(
                 output_embeddings.bias.data,
-                (0, output_embeddings.weight.shape[0] - output_embeddings.bias.shape[0],),
+                (
+                    0,
+                    output_embeddings.weight.shape[0] - output_embeddings.bias.shape[0],
+                ),
                 "constant",
                 0,
             )
         if hasattr(output_embeddings, "out_features") and hasattr(input_embeddings, "num_embeddings"):
             output_embeddings.out_features = input_embeddings.num_embeddings
 
-    def resize_token_embeddings(self, new_num_tokens: Optional[int] = None) -> torch.nn.Embedding:
+    def resize_token_embeddings(self, new_num_tokens: Optional[int] = None) -> nn.Embedding:
         """
         Resizes input token embeddings matrix of the model if :obj:`new_num_tokens != config.vocab_size`.
 
@@ -444,20 +632,19 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin):
             new_num_tokens (:obj:`int`, `optional`):
                 The number of new tokens in the embedding matrix. Increasing the size will add newly initialized
                 vectors at the end. Reducing the size will remove vectors from the end. If not provided or :obj:`None`,
-                just returns a pointer to the input tokens :obj:`torch.nn.Embedding` module of the model wihtout doing
+                just returns a pointer to the input tokens :obj:`torch.nn.Embedding` module of the model without doing
                 anything.
 
         Return:
             :obj:`torch.nn.Embedding`: Pointer to the input tokens Embeddings Module of the model.
         """
-        base_model = getattr(self, self.base_model_prefix, self)  # get the base model if needed
-        model_embeds = base_model._resize_token_embeddings(new_num_tokens)
+        model_embeds = self._resize_token_embeddings(new_num_tokens)
         if new_num_tokens is None:
             return model_embeds
 
         # Update base model and current model config
         self.config.vocab_size = new_num_tokens
-        base_model.vocab_size = new_num_tokens
+        self.vocab_size = new_num_tokens
 
         # Tie weights again if needed
         self.tie_weights()
@@ -468,11 +655,18 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin):
         old_embeddings = self.get_input_embeddings()
         new_embeddings = self._get_resized_embeddings(old_embeddings, new_num_tokens)
         self.set_input_embeddings(new_embeddings)
+
+        # if word embeddings are not tied, make sure that lm head is resized as well
+        if self.get_output_embeddings() is not None and not self.config.tie_word_embeddings:
+            old_lm_head = self.get_output_embeddings()
+            new_lm_head = self._get_resized_lm_head(old_lm_head, new_num_tokens)
+            self.set_output_embeddings(new_lm_head)
+
         return self.get_input_embeddings()
 
     def _get_resized_embeddings(
-        self, old_embeddings: torch.nn.Embedding, new_num_tokens: Optional[int] = None
-    ) -> torch.nn.Embedding:
+        self, old_embeddings: nn.Embedding, new_num_tokens: Optional[int] = None
+    ) -> nn.Embedding:
         """
         Build a resized Embedding Module from a provided token Embedding Module. Increasing the size will add newly
         initialized vectors at the end. Reducing the size will remove vectors from the end
@@ -485,7 +679,7 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin):
 
                 Increasing the size will add newly initialized vectors at the end. Reducing the size will remove
                 vectors from the end. If not provided or :obj:`None`, just returns a pointer to the input tokens
-                :obj:`torch.nn.Embedding`` module of the model wihtout doing anything.
+                :obj:`torch.nn.Embedding`` module of the model without doing anything.
 
         Return:
             :obj:`torch.nn.Embedding`: Pointer to the resized Embedding Module or the old Embedding Module if
@@ -494,36 +688,123 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin):
         if new_num_tokens is None:
             return old_embeddings
 
-        old_num_tokens, old_embedding_dim = old_embeddings.weight.size()
+        if is_deepspeed_zero3_enabled():
+            import deepspeed
+
+            with deepspeed.zero.GatheredParameters(old_embeddings.weight, modifier_rank=None):
+                old_num_tokens, old_embedding_dim = old_embeddings.weight.size()
+        else:
+            old_num_tokens, old_embedding_dim = old_embeddings.weight.size()
+
         if old_num_tokens == new_num_tokens:
             return old_embeddings
 
+        if not isinstance(old_embeddings, nn.Embedding):
+            raise TypeError(
+                f"Old embeddings are of type {type(old_embeddings)}, which is not an instance of {nn.Embedding}."
+                f"You should either use a different resize function or make sure that `old_embeddings` are an instance of {nn.Embedding}."
+            )
+
         # Build new embeddings
-        new_embeddings = nn.Embedding(new_num_tokens, old_embedding_dim)
-        new_embeddings.to(old_embeddings.weight.device)
+        new_embeddings = nn.Embedding(new_num_tokens, old_embedding_dim).to(
+            self.device, dtype=old_embeddings.weight.dtype
+        )
 
         # initialize all new embeddings (in particular added tokens)
         self._init_weights(new_embeddings)
 
         # Copy token embeddings from the previous weights
-        num_tokens_to_copy = min(old_num_tokens, new_num_tokens)
-        new_embeddings.weight.data[:num_tokens_to_copy, :] = old_embeddings.weight.data[:num_tokens_to_copy, :]
+
+        # numbers of tokens to copy
+        n = min(old_num_tokens, new_num_tokens)
+        if is_deepspeed_zero3_enabled():
+            import deepspeed
+
+            with deepspeed.zero.GatheredParameters(old_embeddings.weight, modifier_rank=0):
+                if torch.distributed.get_rank() == 0:
+                    new_embeddings.weight.data[:n, :] = old_embeddings.weight.data[:n, :]
+        else:
+            new_embeddings.weight.data[:n, :] = old_embeddings.weight.data[:n, :]
 
         return new_embeddings
 
+    def _get_resized_lm_head(
+        self, old_lm_head: nn.Linear, new_num_tokens: Optional[int] = None, transposed: Optional[bool] = False
+    ) -> nn.Linear:
+        """
+        Build a resized Linear Module from a provided old Linear Module. Increasing the size will add newly initialized
+        vectors at the end. Reducing the size will remove vectors from the end
+
+        Args:
+            old_lm_head (:obj:`torch.nn.Linear`):
+                Old lm head liner layer to be resized.
+            new_num_tokens (:obj:`int`, `optional`):
+                New number of tokens in the linear matrix.
+
+                Increasing the size will add newly initialized vectors at the end. Reducing the size will remove
+                vectors from the end. If not provided or :obj:`None`, just returns a pointer to the input tokens
+                :obj:`torch.nn.Linear`` module of the model without doing anything.
+            transposed (:obj:`bool`, `optional`, defaults to :obj:`False`):
+                Whether ``old_lm_head`` is transposed or not. If True ``old_lm_head.size()`` is ``lm_head_dim,
+                vocab_size`` else ``vocab_size, lm_head_dim``.
+
+        Return:
+            :obj:`torch.nn.Linear`: Pointer to the resized Linear Module or the old Linear Module if
+            :obj:`new_num_tokens` is :obj:`None`
+        """
+        if new_num_tokens is None:
+            return old_lm_head
+
+        old_num_tokens, old_lm_head_dim = (
+            old_lm_head.weight.size() if not transposed else old_lm_head.weight.t().size()
+        )
+
+        if old_num_tokens == new_num_tokens:
+            return old_lm_head
+
+        if not isinstance(old_lm_head, nn.Linear):
+            raise TypeError(
+                f"Old language model head is of type {type(old_lm_head)}, which is not an instance of {nn.Linear}."
+                f"You should either use a different resize function or make sure that `old_embeddings` are an instance of {nn.Linear}."
+            )
+
+        # Build new lm head
+        new_lm_head_shape = (old_lm_head_dim, new_num_tokens) if not transposed else (new_num_tokens, old_lm_head_dim)
+        has_new_lm_head_bias = old_lm_head.bias is not None
+        new_lm_head = nn.Linear(*new_lm_head_shape, bias=has_new_lm_head_bias).to(self.device)
+
+        # initialize new lm head (in particular added tokens)
+        self._init_weights(new_lm_head)
+
+        num_tokens_to_copy = min(old_num_tokens, new_num_tokens)
+
+        # Copy old lm head weights to new lm head
+        if not transposed:
+            new_lm_head.weight.data[:num_tokens_to_copy, :] = old_lm_head.weight.data[:num_tokens_to_copy, :]
+        else:
+            new_lm_head.weight.data[:, :num_tokens_to_copy] = old_lm_head.weight.data[:, :num_tokens_to_copy]
+
+        # Copy bias weights to new lm head
+        if has_new_lm_head_bias:
+            new_lm_head.bias.data[:num_tokens_to_copy] = old_lm_head.bias.data[:num_tokens_to_copy]
+
+        return new_lm_head
+
     def init_weights(self):
         """
-        Initializes and prunes weights if needed.
+        If needed prunes and maybe initializes weights.
         """
-        # Initialize weights
-        self.apply(self._init_weights)
-
         # Prune heads if needed
         if self.config.pruned_heads:
             self.prune_heads(self.config.pruned_heads)
 
-        # Tie weights if needed
-        self.tie_weights()
+        if _init_weights:
+            # Initialize weights
+            self.apply(self._init_weights)
+
+            # Tie weights should be skipped when not initializing all weights
+            # since from_pretrained(...) calls tie weights anyways
+            self.tie_weights()
 
     def prune_heads(self, heads_to_prune: Dict[int, List[int]]):
         """
@@ -531,9 +812,9 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin):
 
         Arguments:
             heads_to_prune (:obj:`Dict[int, List[int]]`):
-                Dictionary with keys being selected layer indices (:obj:`int`) and associated values being the list
-                of heads to prune in said layer (list of :obj:`int`). For instance {1: [0, 2], 2: [2, 3]} will
-                prune heads 0 and 2 on layer 1 and heads 2 and 3 on layer 2.
+                Dictionary with keys being selected layer indices (:obj:`int`) and associated values being the list of
+                heads to prune in said layer (list of :obj:`int`). For instance {1: [0, 2], 2: [2, 3]} will prune heads
+                0 and 2 on layer 1 and heads 2 and 3 on layer 2.
         """
         # save new sets of pruned heads as union of previously stored pruned heads and newly pruned heads
         for layer, heads in heads_to_prune.items():
@@ -542,50 +823,82 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin):
 
         self.base_model._prune_heads(heads_to_prune)
 
-    def save_pretrained(self, save_directory):
+    def save_pretrained(
+        self,
+        save_directory: Union[str, os.PathLike],
+        save_config: bool = True,
+        state_dict: Optional[dict] = None,
+        save_function: Callable = torch.save,
+        push_to_hub: bool = False,
+        **kwargs,
+    ):
         """
         Save a model and its configuration file to a directory, so that it can be re-loaded using the
         `:func:`~transformers.PreTrainedModel.from_pretrained`` class method.
 
         Arguments:
-            save_directory (:obj:`str`):
+            save_directory (:obj:`str` or :obj:`os.PathLike`):
                 Directory to which to save. Will be created if it doesn't exist.
+            save_config (:obj:`bool`, `optional`, defaults to :obj:`True`):
+                Whether or not to save the config of the model. Useful when in distributed training like TPUs and need
+                to call this function on all processes. In this case, set :obj:`save_config=True` only on the main
+                process to avoid race conditions.
+            state_dict (nested dictionary of :obj:`torch.Tensor`):
+                The state dictionary of the model to save. Will default to :obj:`self.state_dict()`, but can be used to
+                only save parts of the model or if special precautions need to be taken when recovering the state
+                dictionary of a model (like when using model parallelism).
+            save_function (:obj:`Callable`):
+                The function to use to save the state dictionary. Useful on distributed training like TPUs when one
+                need to replace :obj:`torch.save` by another method.
+            push_to_hub (:obj:`bool`, `optional`, defaults to :obj:`False`):
+                Whether or not to push your model to the Hugging Face model hub after saving it.
+            kwargs:
+                Additional key word arguments passed along to the
+                :meth:`~transformers.file_utils.PushToHubMixin.push_to_hub` method.
         """
         if os.path.isfile(save_directory):
-            logger.error("Provided path ({}) should be a directory, not a file".format(save_directory))
+            logger.error(f"Provided path ({save_directory}) should be a directory, not a file")
             return
         os.makedirs(save_directory, exist_ok=True)
 
         # Only save the model itself if we are using distributed training
-        model_to_save = self.module if hasattr(self, "module") else self
+        model_to_save = unwrap_model(self)
 
         # Attach architecture to the config
         model_to_save.config.architectures = [model_to_save.__class__.__name__]
 
+        # Save the config
+        if save_config:
+            model_to_save.config.save_pretrained(save_directory)
+
+        # Save the model
+        if state_dict is None:
+            state_dict = model_to_save.state_dict()
+
+        # Handle the case where some state_dict keys shouldn't be saved
+        if self._keys_to_ignore_on_save is not None:
+            state_dict = {k: v for k, v in state_dict.items() if k not in self._keys_to_ignore_on_save}
+
         # If we save using the predefined names, we can load using `from_pretrained`
         output_model_file = os.path.join(save_directory, WEIGHTS_NAME)
+        save_function(state_dict, output_model_file)
 
-        if getattr(self.config, "xla_device", False):
-            import torch_xla.core.xla_model as xm
+        logger.info(f"Model weights saved in {output_model_file}")
 
-            if xm.is_master_ordinal():
-                # Save configuration file
-                model_to_save.config.save_pretrained(save_directory)
-            # xm.save takes care of saving only from master
-            xm.save(model_to_save.state_dict(), output_model_file)
-        else:
-            model_to_save.config.save_pretrained(save_directory)
-            torch.save(model_to_save.state_dict(), output_model_file)
-
-        logger.info("Model weights saved in {}".format(output_model_file))
+        if push_to_hub:
+            saved_files = [output_model_file]
+            if save_config:
+                saved_files.append(os.path.join(save_directory, CONFIG_NAME))
+            url = self._push_to_hub(save_files=saved_files, **kwargs)
+            logger.info(f"Model pushed to the hub in this commit: {url}")
 
     @classmethod
-    def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
+    def from_pretrained(cls, pretrained_model_name_or_path: Optional[Union[str, os.PathLike]], *model_args, **kwargs):
         r"""
         Instantiate a pretrained pytorch model from a pre-trained model configuration.
 
-        The model is set in evaluation mode by default using ``model.eval()`` (Dropout modules are deactivated).
-        To train the model, you should first set it back in training mode with ``model.train()``.
+        The model is set in evaluation mode by default using ``model.eval()`` (Dropout modules are deactivated). To
+        train the model, you should first set it back in training mode with ``model.train()``.
 
         The warning `Weights from XXX not initialized from pretrained model` means that the weights of XXX do not come
         pretrained with the rest of the model. It is up to you to train those weights with a downstream fine-tuning
@@ -595,37 +908,39 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin):
         weights are discarded.
 
         Parameters:
-            pretrained_model_name_or_path (:obj:`str`, `optional`):
+            pretrained_model_name_or_path (:obj:`str` or :obj:`os.PathLike`, `optional`):
                 Can be either:
 
-                    - A string with the `shortcut name` of a pretrained model to load from cache or download, e.g.,
-                      ``bert-base-uncased``.
-                    - A string with the `identifier name` of a pretrained model that was user-uploaded to our S3, e.g.,
-                      ``dbmdz/bert-base-german-cased``.
+                    - A string, the `model id` of a pretrained model hosted inside a model repo on huggingface.co.
+                      Valid model ids can be located at the root-level, like ``bert-base-uncased``, or namespaced under
+                      a user or organization name, like ``dbmdz/bert-base-german-cased``.
                     - A path to a `directory` containing model weights saved using
                       :func:`~transformers.PreTrainedModel.save_pretrained`, e.g., ``./my_model_directory/``.
                     - A path or url to a `tensorflow index checkpoint file` (e.g, ``./tf_model/model.ckpt.index``). In
                       this case, ``from_tf`` should be set to :obj:`True` and a configuration object should be provided
                       as ``config`` argument. This loading path is slower than converting the TensorFlow checkpoint in
                       a PyTorch model using the provided conversion scripts and loading the PyTorch model afterwards.
+                    - A path or url to a model folder containing a `flax checkpoint file` in `.msgpack` format (e.g,
+                      ``./flax_model/`` containing ``flax_model.msgpack``). In this case, ``from_flax`` should be set
+                      to :obj:`True`.
                     - :obj:`None` if you are both providing the configuration and state dictionary (resp. with keyword
                       arguments ``config`` and ``state_dict``).
             model_args (sequence of positional arguments, `optional`):
                 All remaning positional arguments will be passed to the underlying model's ``__init__`` method.
-            config (:obj:`Union[PretrainedConfig, str]`, `optional`):
+            config (:obj:`Union[PretrainedConfig, str, os.PathLike]`, `optional`):
                 Can be either:
 
                     - an instance of a class derived from :class:`~transformers.PretrainedConfig`,
-                    - a string valid as input to :func:`~transformers.PretrainedConfig.from_pretrained`.
+                    - a string or path valid as input to :func:`~transformers.PretrainedConfig.from_pretrained`.
 
                 Configuration for the model to use instead of an automatically loaded configuation. Configuration can
                 be automatically loaded when:
 
-                    - The model is a model provided by the library (loaded with the `shortcut name` string of a
-                      pretrained model).
+                    - The model is a model provided by the library (loaded with the `model id` string of a pretrained
+                      model).
                     - The model was saved using :func:`~transformers.PreTrainedModel.save_pretrained` and is reloaded
-                      by suppling the save directory.
-                    - The model is loaded by suppling a local directory as ``pretrained_model_name_or_path`` and a
+                      by supplying the save directory.
+                    - The model is loaded by supplying a local directory as ``pretrained_model_name_or_path`` and a
                       configuration JSON file named `config.json` is found in the directory.
             state_dict (:obj:`Dict[str, torch.Tensor]`, `optional`):
                 A state dictionary to use instead of a state dictionary loaded from saved weights file.
@@ -634,11 +949,14 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin):
                 weights. In this case though, you should check if using
                 :func:`~transformers.PreTrainedModel.save_pretrained` and
                 :func:`~transformers.PreTrainedModel.from_pretrained` is not a simpler option.
-            cache_dir (:obj:`str`, `optional`):
+            cache_dir (:obj:`Union[str, os.PathLike]`, `optional`):
                 Path to a directory in which a downloaded pretrained model configuration should be cached if the
                 standard cache should not be used.
             from_tf (:obj:`bool`, `optional`, defaults to :obj:`False`):
                 Load the model weights from a TensorFlow checkpoint save file (see docstring of
+                ``pretrained_model_name_or_path`` argument).
+            from_flax (:obj:`bool`, `optional`, defaults to :obj:`False`):
+                Load the model weights from a Flax checkpoint save file (see docstring of
                 ``pretrained_model_name_or_path`` argument).
             force_download (:obj:`bool`, `optional`, defaults to :obj:`False`):
                 Whether or not to force the (re-)download of the model weights and configuration files, overriding the
@@ -647,20 +965,36 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin):
                 Whether or not to delete incompletely received files. Will attempt to resume the download if such a
                 file exists.
             proxies (:obj:`Dict[str, str], `optional`):
-                A dictionary of proxy servers to use by protocol or endpoint, e.g.,
-                :obj:`{'http': 'foo.bar:3128', 'http://hostname': 'foo.bar:4012'}`. The proxies are used on each
-                request.
+                A dictionary of proxy servers to use by protocol or endpoint, e.g., :obj:`{'http': 'foo.bar:3128',
+                'http://hostname': 'foo.bar:4012'}`. The proxies are used on each request.
             output_loading_info(:obj:`bool`, `optional`, defaults to :obj:`False`):
-                Whether ot not to also return a dictionnary containing missing keys, unexpected keys and error
-                messages.
+                Whether ot not to also return a dictionary containing missing keys, unexpected keys and error messages.
             local_files_only(:obj:`bool`, `optional`, defaults to :obj:`False`):
-                Whether or not to only look at local files (e.g., not try doanloading the model).
-            use_cdn(:obj:`bool`, `optional`, defaults to :obj:`True`):
-                Whether or not to use Cloudfront (a Content Delivery Network, or CDN) when searching for the model on
-                our S3 (faster). Should be set to :obj:`False` for checkpoints larger than 20GB.
+                Whether or not to only look at local files (i.e., do not try to download the model).
+            use_auth_token (:obj:`str` or `bool`, `optional`):
+                The token to use as HTTP bearer authorization for remote files. If :obj:`True`, will use the token
+                generated when running :obj:`transformers-cli login` (stored in :obj:`~/.huggingface`).
+            revision(:obj:`str`, `optional`, defaults to :obj:`"main"`):
+                The specific model version to use. It can be a branch name, a tag name, or a commit id, since we use a
+                git-based system for storing models and other artifacts on huggingface.co, so ``revision`` can be any
+                identifier allowed by git.
+            mirror(:obj:`str`, `optional`):
+                Mirror source to accelerate downloads in China. If you are from China and have an accessibility
+                problem, you can set this option to resolve it. Note that we do not guarantee the timeliness or safety.
+                Please refer to the mirror site for more information.
+            _fast_init(:obj:`bool`, `optional`, defaults to `:obj:`True`):
+                Whether or not to disable fast initialization.
+
+                .. warning::
+
+                    One should only disable `_fast_init` to ensure backwards compatibility with
+                    ``transformers.__version__ < 4.6.0`` for seeded model initialization. This argument will be removed
+                    at the next major version. See `pull request 11471
+                    <https://github.com/huggingface/transformers/pull/11471>`__ for more information.
+
             kwargs (remaining dictionary of keyword arguments, `optional`):
                 Can be used to update the configuration object (after it being loaded) and initiate the model (e.g.,
-                :obj:`output_attention=True`). Behaves differently depending on whether a ``config`` is provided or
+                :obj:`output_attentions=True`). Behaves differently depending on whether a ``config`` is provided or
                 automatically loaded:
 
                     - If a configuration is provided with ``config``, ``**kwargs`` will be directly passed to the
@@ -672,30 +1006,57 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin):
                       with the supplied ``kwargs`` value. Remaining keys that do not correspond to any configuration
                       attribute will be passed to the underlying model's ``__init__`` function.
 
+        .. note::
+
+            Passing :obj:`use_auth_token=True` is required when you want to use a private model.
+
+        .. note::
+
+            Activate the special `"offline-mode"
+            <https://huggingface.co/transformers/installation.html#offline-mode>`__ to use this method in a firewalled
+            environment.
+
         Examples::
 
-            from transformers import BertConfig, BertModel
-            # Download model and configuration from S3 and cache.
-            model = BertModel.from_pretrained('bert-base-uncased')
-            # Model was saved using `save_pretrained('./test/saved_model/')` (for example purposes, not runnable).
-            model = BertModel.from_pretrained('./test/saved_model/')
-            # Update configuration during loading.
-            model = BertModel.from_pretrained('bert-base-uncased', output_attention=True)
-            assert model.config.output_attention == True
-            # Loading from a TF checkpoint file instead of a PyTorch model (slower, for example purposes, not runnable).
-            config = BertConfig.from_json_file('./tf_model/my_tf_model_config.json')
-            model = BertModel.from_pretrained('./tf_model/my_tf_checkpoint.ckpt.index', from_tf=True, config=config)
+            >>> from transformers import BertConfig, BertModel
+            >>> # Download model and configuration from huggingface.co and cache.
+            >>> model = BertModel.from_pretrained('bert-base-uncased')
+            >>> # Model was saved using `save_pretrained('./test/saved_model/')` (for example purposes, not runnable).
+            >>> model = BertModel.from_pretrained('./test/saved_model/')
+            >>> # Update configuration during loading.
+            >>> model = BertModel.from_pretrained('bert-base-uncased', output_attentions=True)
+            >>> assert model.config.output_attentions == True
+            >>> # Loading from a TF checkpoint file instead of a PyTorch model (slower, for example purposes, not runnable).
+            >>> config = BertConfig.from_json_file('./tf_model/my_tf_model_config.json')
+            >>> model = BertModel.from_pretrained('./tf_model/my_tf_checkpoint.ckpt.index', from_tf=True, config=config)
+            >>> # Loading from a Flax checkpoint file instead of a PyTorch model (slower)
+            >>> model = BertModel.from_pretrained('bert-base-uncased', from_flax=True)
+
         """
         config = kwargs.pop("config", None)
         state_dict = kwargs.pop("state_dict", None)
         cache_dir = kwargs.pop("cache_dir", None)
         from_tf = kwargs.pop("from_tf", False)
+        from_flax = kwargs.pop("from_flax", False)
         force_download = kwargs.pop("force_download", False)
         resume_download = kwargs.pop("resume_download", False)
         proxies = kwargs.pop("proxies", None)
         output_loading_info = kwargs.pop("output_loading_info", False)
         local_files_only = kwargs.pop("local_files_only", False)
-        use_cdn = kwargs.pop("use_cdn", True)
+        use_auth_token = kwargs.pop("use_auth_token", None)
+        revision = kwargs.pop("revision", None)
+        mirror = kwargs.pop("mirror", None)
+        from_pipeline = kwargs.pop("_from_pipeline", None)
+        from_auto_class = kwargs.pop("_from_auto", False)
+        _fast_init = kwargs.pop("_fast_init", True)
+
+        user_agent = {"file_type": "model", "framework": "pytorch", "from_auto_class": from_auto_class}
+        if from_pipeline is not None:
+            user_agent["using_pipeline"] = from_pipeline
+
+        if is_offline_mode() and not local_files_only:
+            logger.info("Offline mode: forcing local_files_only=True")
+            local_files_only = True
 
         # Load config if we don't provide a configuration
         if not isinstance(config, PretrainedConfig):
@@ -709,6 +1070,10 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin):
                 resume_download=resume_download,
                 proxies=proxies,
                 local_files_only=local_files_only,
+                use_auth_token=use_auth_token,
+                revision=revision,
+                _from_auto=from_auto_class,
+                _from_pipeline=from_pipeline,
                 **kwargs,
             )
         else:
@@ -716,37 +1081,48 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin):
 
         # Load model
         if pretrained_model_name_or_path is not None:
+            pretrained_model_name_or_path = str(pretrained_model_name_or_path)
             if os.path.isdir(pretrained_model_name_or_path):
                 if from_tf and os.path.isfile(os.path.join(pretrained_model_name_or_path, TF_WEIGHTS_NAME + ".index")):
-                    # Load from a TF 1.0 checkpoint
+                    # Load from a TF 1.0 checkpoint in priority if from_tf
                     archive_file = os.path.join(pretrained_model_name_or_path, TF_WEIGHTS_NAME + ".index")
                 elif from_tf and os.path.isfile(os.path.join(pretrained_model_name_or_path, TF2_WEIGHTS_NAME)):
-                    # Load from a TF 2.0 checkpoint
+                    # Load from a TF 2.0 checkpoint in priority if from_tf
                     archive_file = os.path.join(pretrained_model_name_or_path, TF2_WEIGHTS_NAME)
+                elif from_flax and os.path.isfile(os.path.join(pretrained_model_name_or_path, FLAX_WEIGHTS_NAME)):
+                    # Load from a Flax checkpoint in priority if from_flax
+                    archive_file = os.path.join(pretrained_model_name_or_path, FLAX_WEIGHTS_NAME)
                 elif os.path.isfile(os.path.join(pretrained_model_name_or_path, WEIGHTS_NAME)):
                     # Load from a PyTorch checkpoint
                     archive_file = os.path.join(pretrained_model_name_or_path, WEIGHTS_NAME)
                 else:
                     raise EnvironmentError(
-                        "Error no file named {} found in directory {} or `from_tf` set to False".format(
-                            [WEIGHTS_NAME, TF2_WEIGHTS_NAME, TF_WEIGHTS_NAME + ".index"],
-                            pretrained_model_name_or_path,
-                        )
+                        f"Error no file named {[WEIGHTS_NAME, TF2_WEIGHTS_NAME, TF_WEIGHTS_NAME + '.index', FLAX_WEIGHTS_NAME]} found in "
+                        f"directory {pretrained_model_name_or_path} or `from_tf` and `from_flax` set to False."
                     )
             elif os.path.isfile(pretrained_model_name_or_path) or is_remote_url(pretrained_model_name_or_path):
                 archive_file = pretrained_model_name_or_path
             elif os.path.isfile(pretrained_model_name_or_path + ".index"):
-                assert (
-                    from_tf
-                ), "We found a TensorFlow checkpoint at {}, please set from_tf to True to load from this checkpoint".format(
-                    pretrained_model_name_or_path + ".index"
-                )
+                if not from_tf:
+                    raise ValueError(
+                        f"We found a TensorFlow checkpoint at {pretrained_model_name_or_path + '.index'}, please set "
+                        "from_tf to True to load from this checkpoint."
+                    )
                 archive_file = pretrained_model_name_or_path + ".index"
             else:
+                # set correct filename
+                if from_tf:
+                    filename = TF2_WEIGHTS_NAME
+                elif from_flax:
+                    filename = FLAX_WEIGHTS_NAME
+                else:
+                    filename = WEIGHTS_NAME
+
                 archive_file = hf_bucket_url(
                     pretrained_model_name_or_path,
-                    filename=(TF2_WEIGHTS_NAME if from_tf else WEIGHTS_NAME),
-                    use_cdn=use_cdn,
+                    filename=filename,
+                    revision=revision,
+                    mirror=mirror,
                 )
 
             try:
@@ -758,10 +1134,11 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin):
                     proxies=proxies,
                     resume_download=resume_download,
                     local_files_only=local_files_only,
+                    use_auth_token=use_auth_token,
+                    user_agent=user_agent,
                 )
-                if resolved_archive_file is None:
-                    raise EnvironmentError
-            except EnvironmentError:
+            except EnvironmentError as err:
+                logger.error(err)
                 msg = (
                     f"Can't load weights for '{pretrained_model_name_or_path}'. Make sure that:\n\n"
                     f"- '{pretrained_model_name_or_path}' is a correct model identifier listed on 'https://huggingface.co/models'\n\n"
@@ -770,27 +1147,27 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin):
                 raise EnvironmentError(msg)
 
             if resolved_archive_file == archive_file:
-                logger.info("loading weights file {}".format(archive_file))
+                logger.info(f"loading weights file {archive_file}")
             else:
-                logger.info("loading weights file {} from cache at {}".format(archive_file, resolved_archive_file))
+                logger.info(f"loading weights file {archive_file} from cache at {resolved_archive_file}")
         else:
             resolved_archive_file = None
 
+        config.name_or_path = pretrained_model_name_or_path
+
         # Instantiate model.
-        model = cls(config, *model_args, **model_kwargs)
+        if is_deepspeed_zero3_enabled():
+            import deepspeed
 
-        if state_dict is None and not from_tf:
-            try:
-                state_dict = torch.load(resolved_archive_file, map_location="cpu")
-            except Exception:
-                raise OSError(
-                    "Unable to load weights from pytorch checkpoint file. "
-                    "If you tried to load a PyTorch model from a TF 2.0 checkpoint, please set from_tf=True. "
-                )
-
-        missing_keys = []
-        unexpected_keys = []
-        error_msgs = []
+            logger.info("Detected DeepSpeed ZeRO-3: activating zero.init() for this model")
+            # this immediately partitions the model across all gpus, to avoid the overhead in time
+            # and memory copying it on CPU or each GPU first
+            with deepspeed.zero.Init(config=deepspeed_config()):
+                with no_init_weights(_enable=_fast_init):
+                    model = cls(config, *model_args, **model_kwargs)
+        else:
+            with no_init_weights(_enable=_fast_init):
+                model = cls(config, *model_args, **model_kwargs)
 
         if from_tf:
             if resolved_archive_file.endswith(".index"):
@@ -799,7 +1176,7 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin):
             else:
                 # Load from our TensorFlow 2.0 checkpoints
                 try:
-                    from transformers import load_tf2_checkpoint_in_pytorch_model
+                    from .modeling_tf_pytorch_utils import load_tf2_checkpoint_in_pytorch_model
 
                     model = load_tf2_checkpoint_in_pytorch_model(model, resolved_archive_file, allow_missing_keys=True)
                 except ImportError:
@@ -808,93 +1185,34 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin):
                         "https://pytorch.org/ and https://www.tensorflow.org/install/ for installation instructions."
                     )
                     raise
+        elif from_flax:
+            try:
+                from .modeling_flax_pytorch_utils import load_flax_checkpoint_in_pytorch_model
+
+                model = load_flax_checkpoint_in_pytorch_model(model, resolved_archive_file)
+            except ImportError:
+                logger.error(
+                    "Loading a Flax model in PyTorch, requires both PyTorch and Flax to be installed. Please see "
+                    "https://pytorch.org/ and https://flax.readthedocs.io/en/latest/installation.html for installation instructions."
+                )
+                raise
         else:
-            # Convert old format to new format if needed from a PyTorch state_dict
-            old_keys = []
-            new_keys = []
-            for key in state_dict.keys():
-                new_key = None
-                if "gamma" in key:
-                    new_key = key.replace("gamma", "weight")
-                if "beta" in key:
-                    new_key = key.replace("beta", "bias")
-                if new_key:
-                    old_keys.append(key)
-                    new_keys.append(new_key)
-            for old_key, new_key in zip(old_keys, new_keys):
-                state_dict[new_key] = state_dict.pop(old_key)
-
-            # copy state_dict so _load_from_state_dict can modify it
-            metadata = getattr(state_dict, "_metadata", None)
-            state_dict = state_dict.copy()
-            if metadata is not None:
-                state_dict._metadata = metadata
-
-            # PyTorch's `_load_from_state_dict` does not copy parameters in a module's descendants
-            # so we need to apply the function recursively.
-            def load(module: nn.Module, prefix=""):
-                local_metadata = {} if metadata is None else metadata.get(prefix[:-1], {})
-                module._load_from_state_dict(
-                    state_dict, prefix, local_metadata, True, missing_keys, unexpected_keys, error_msgs,
-                )
-                for name, child in module._modules.items():
-                    if child is not None:
-                        load(child, prefix + name + ".")
-
-            # Make sure we are able to load base models as well as derived models (with heads)
-            start_prefix = ""
-            model_to_load = model
-            has_prefix_module = any(s.startswith(cls.base_model_prefix) for s in state_dict.keys())
-            if not hasattr(model, cls.base_model_prefix) and has_prefix_module:
-                start_prefix = cls.base_model_prefix + "."
-            if hasattr(model, cls.base_model_prefix) and not has_prefix_module:
-                model_to_load = getattr(model, cls.base_model_prefix)
-
-            load(model_to_load, prefix=start_prefix)
-
-            if model.__class__.__name__ != model_to_load.__class__.__name__:
-                base_model_state_dict = model_to_load.state_dict().keys()
-                head_model_state_dict_without_base_prefix = [
-                    key.split(cls.base_model_prefix + ".")[-1] for key in model.state_dict().keys()
-                ]
-                missing_keys.extend(head_model_state_dict_without_base_prefix - base_model_state_dict)
-
-            # Some models may have keys that are not in the state by design, removing them before needlessly warning
-            # the user.
-            if cls.authorized_missing_keys is not None:
-                for pat in cls.authorized_missing_keys:
-                    missing_keys = [k for k in missing_keys if re.search(pat, k) is None]
-
-            if len(unexpected_keys) > 0:
-                logger.warning(
-                    f"Some weights of the model checkpoint at {pretrained_model_name_or_path} were not used when "
-                    f"initializing {model.__class__.__name__}: {unexpected_keys}\n"
-                    f"- This IS expected if you are initializing {model.__class__.__name__} from the checkpoint of a model trained on another task "
-                    f"or with another architecture (e.g. initializing a BertForSequenceClassification model from a BertForPretraining model).\n"
-                    f"- This IS NOT expected if you are initializing {model.__class__.__name__} from the checkpoint of a model that you expect "
-                    f"to be exactly identical (initializing a BertForSequenceClassification model from a BertForSequenceClassification model)."
-                )
-            else:
-                logger.info(f"All model checkpoint weights were used when initializing {model.__class__.__name__}.\n")
-            if len(missing_keys) > 0:
-                logger.warning(
-                    f"Some weights of {model.__class__.__name__} were not initialized from the model checkpoint at {pretrained_model_name_or_path} "
-                    f"and are newly initialized: {missing_keys}\n"
-                    f"You should probably TRAIN this model on a down-stream task to be able to use it for predictions and inference."
-                )
-            else:
-                logger.info(
-                    f"All the weights of {model.__class__.__name__} were initialized from the model checkpoint at {pretrained_model_name_or_path}.\n"
-                    f"If your task is similar to the task the model of the checkpoint was trained on, "
-                    f"you can already use {model.__class__.__name__} for predictions without further training."
-                )
-            if len(error_msgs) > 0:
-                raise RuntimeError(
-                    "Error(s) in loading state_dict for {}:\n\t{}".format(
-                        model.__class__.__name__, "\n\t".join(error_msgs)
+            if state_dict is None:
+                try:
+                    state_dict = torch.load(resolved_archive_file, map_location="cpu")
+                except Exception:
+                    raise OSError(
+                        f"Unable to load weights from pytorch checkpoint file for '{pretrained_model_name_or_path}' "
+                        f"at '{resolved_archive_file}'"
+                        "If you tried to load a PyTorch model from a TF 2.0 checkpoint, please set from_tf=True. "
                     )
-                )
-        model.tie_weights()  # make sure token embedding weights are still tied if needed
+
+            model, missing_keys, unexpected_keys, error_msgs = cls._load_state_dict_into_model(
+                model, state_dict, pretrained_model_name_or_path, _fast_init=_fast_init
+            )
+
+        # make sure token embedding weights are still tied if needed
+        model.tie_weights()
 
         # Set model in evaluation mode to deactivate DropOut modules by default
         model.eval()
@@ -907,13 +1225,152 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin):
             }
             return model, loading_info
 
-        if hasattr(config, "xla_device") and config.xla_device and is_torch_tpu_available():
-            import torch_xla.core.xla_model as xm
-
-            model = xm.send_cpu_data_to_device(model, xm.xla_device())
-            model.to(xm.xla_device())
-
         return model
+
+    @classmethod
+    def _load_state_dict_into_model(cls, model, state_dict, pretrained_model_name_or_path, _fast_init=True):
+
+        # Convert old format to new format if needed from a PyTorch state_dict
+        old_keys = []
+        new_keys = []
+        for key in state_dict.keys():
+            new_key = None
+            if "gamma" in key:
+                new_key = key.replace("gamma", "weight")
+            if "beta" in key:
+                new_key = key.replace("beta", "bias")
+            if new_key:
+                old_keys.append(key)
+                new_keys.append(new_key)
+        for old_key, new_key in zip(old_keys, new_keys):
+            state_dict[new_key] = state_dict.pop(old_key)
+
+        # Retrieve missing & unexpected_keys
+        expected_keys = list(model.state_dict().keys())
+        loaded_keys = list(state_dict.keys())
+        prefix = model.base_model_prefix
+
+        has_prefix_module = any(s.startswith(prefix) for s in loaded_keys)
+        expects_prefix_module = any(s.startswith(prefix) for s in expected_keys)
+
+        # key re-naming operations are never done on the keys
+        # that are loaded, but always on the keys of the newly initialized model
+        remove_prefix = not has_prefix_module and expects_prefix_module
+        add_prefix = has_prefix_module and not expects_prefix_module
+
+        if remove_prefix:
+            expected_keys = [".".join(s.split(".")[1:]) if s.startswith(prefix) else s for s in expected_keys]
+        elif add_prefix:
+            expected_keys = [".".join([prefix, s]) for s in expected_keys]
+
+        missing_keys = list(set(expected_keys) - set(loaded_keys))
+        unexpected_keys = list(set(loaded_keys) - set(expected_keys))
+
+        # Some models may have keys that are not in the state by design, removing them before needlessly warning
+        # the user.
+        if cls._keys_to_ignore_on_load_missing is not None:
+            for pat in cls._keys_to_ignore_on_load_missing:
+                missing_keys = [k for k in missing_keys if re.search(pat, k) is None]
+
+        if cls._keys_to_ignore_on_load_unexpected is not None:
+            for pat in cls._keys_to_ignore_on_load_unexpected:
+                unexpected_keys = [k for k in unexpected_keys if re.search(pat, k) is None]
+
+        if _fast_init:
+            # retrieve unintialized modules and initialize
+            unintialized_modules = model.retrieve_modules_from_names(
+                missing_keys, add_prefix=add_prefix, remove_prefix=remove_prefix
+            )
+            for module in unintialized_modules:
+                model._init_weights(module)
+
+        # copy state_dict so _load_from_state_dict can modify it
+        metadata = getattr(state_dict, "_metadata", None)
+        state_dict = state_dict.copy()
+        if metadata is not None:
+            state_dict._metadata = metadata
+
+        error_msgs = []
+
+        # PyTorch's `_load_from_state_dict` does not copy parameters in a module's descendants
+        # so we need to apply the function recursively.
+        def load(module: nn.Module, prefix=""):
+            local_metadata = {} if metadata is None else metadata.get(prefix[:-1], {})
+            args = (state_dict, prefix, local_metadata, True, [], [], error_msgs)
+            if is_deepspeed_zero3_enabled():
+                import deepspeed
+
+                # because zero3 puts placeholders in model params, this context
+                # manager gathers (unpartitions) the params of the current layer, then loads from
+                # the state dict and then re-partitions them again
+                with deepspeed.zero.GatheredParameters(list(module.parameters(recurse=False)), modifier_rank=0):
+                    if torch.distributed.get_rank() == 0:
+                        module._load_from_state_dict(*args)
+            else:
+                module._load_from_state_dict(*args)
+
+            for name, child in module._modules.items():
+                if child is not None:
+                    load(child, prefix + name + ".")
+
+        # Make sure we are able to load base models as well as derived models (with heads)
+        start_prefix = ""
+        model_to_load = model
+        if not hasattr(model, cls.base_model_prefix) and has_prefix_module:
+            start_prefix = cls.base_model_prefix + "."
+        if hasattr(model, cls.base_model_prefix) and not has_prefix_module:
+            model_to_load = getattr(model, cls.base_model_prefix)
+
+        load(model_to_load, prefix=start_prefix)
+
+        if len(unexpected_keys) > 0:
+            logger.warning(
+                f"Some weights of the model checkpoint at {pretrained_model_name_or_path} were not used when "
+                f"initializing {model.__class__.__name__}: {unexpected_keys}\n"
+                f"- This IS expected if you are initializing {model.__class__.__name__} from the checkpoint of a model trained on another task "
+                f"or with another architecture (e.g. initializing a BertForSequenceClassification model from a BertForPreTraining model).\n"
+                f"- This IS NOT expected if you are initializing {model.__class__.__name__} from the checkpoint of a model that you expect "
+                f"to be exactly identical (initializing a BertForSequenceClassification model from a BertForSequenceClassification model)."
+            )
+        else:
+            logger.info(f"All model checkpoint weights were used when initializing {model.__class__.__name__}.\n")
+        if len(missing_keys) > 0:
+            logger.warning(
+                f"Some weights of {model.__class__.__name__} were not initialized from the model checkpoint at {pretrained_model_name_or_path} "
+                f"and are newly initialized: {missing_keys}\n"
+                f"You should probably TRAIN this model on a down-stream task to be able to use it for predictions and inference."
+            )
+        else:
+            logger.info(
+                f"All the weights of {model.__class__.__name__} were initialized from the model checkpoint at {pretrained_model_name_or_path}.\n"
+                f"If your task is similar to the task the model of the checkpoint was trained on, "
+                f"you can already use {model.__class__.__name__} for predictions without further training."
+            )
+        if len(error_msgs) > 0:
+            error_msg = "\n\t".join(error_msgs)
+            raise RuntimeError(f"Error(s) in loading state_dict for {model.__class__.__name__}:\n\t{error_msg}")
+
+        return model, missing_keys, unexpected_keys, error_msgs
+
+    def retrieve_modules_from_names(self, names, add_prefix=False, remove_prefix=False):
+        module_keys = set([".".join(key.split(".")[:-1]) for key in names])
+
+        # torch.nn.ParameterList is a special case where two parameter keywords
+        # are appended to the module name, *e.g.* bert.special_embeddings.0
+        module_keys = module_keys.union(set([".".join(key.split(".")[:-2]) for key in names if key[-1].isdigit()]))
+
+        retrieved_modules = []
+        # retrieve all modules that has at least one missing weight name
+        for name, module in self.named_modules():
+            if remove_prefix:
+                name = ".".join(name.split(".")[1:]) if name.startswith(self.base_model_prefix) else name
+            elif add_prefix:
+                name = ".".join([self.base_model_prefix, name]) if len(name) > 0 else self.base_model_prefix
+
+            if name in module_keys:
+                retrieved_modules.append(module)
+
+        return retrieved_modules
 
 
 class Conv1D(nn.Module):
@@ -963,8 +1420,8 @@ class PoolerStartLogits(nn.Module):
             hidden_states (:obj:`torch.FloatTensor` of shape :obj:`(batch_size, seq_len, hidden_size)`):
                 The final hidden states of the model.
             p_mask (:obj:`torch.FloatTensor` of shape :obj:`(batch_size, seq_len)`, `optional`):
-                Mask for tokens at invalid position, such as query and special symbols (PAD, SEP, CLS).
-                1.0 means token should be masked.
+                Mask for tokens at invalid position, such as query and special symbols (PAD, SEP, CLS). 1.0 means token
+                should be masked.
 
         Returns:
             :obj:`torch.FloatTensor`: The start logits for SQuAD.
@@ -972,7 +1429,7 @@ class PoolerStartLogits(nn.Module):
         x = self.dense(hidden_states).squeeze(-1)
 
         if p_mask is not None:
-            if next(self.parameters()).dtype == torch.float16:
+            if get_parameter_dtype(self) == torch.float16:
                 x = x * (1 - p_mask) - 65500 * p_mask
             else:
                 x = x * (1 - p_mask) - 1e30 * p_mask
@@ -1013,8 +1470,8 @@ class PoolerEndLogits(nn.Module):
             start_positions (:obj:`torch.LongTensor` of shape :obj:`(batch_size,)`, `optional`):
                 The position of the first token for the labeled span.
             p_mask (:obj:`torch.FloatTensor` of shape :obj:`(batch_size, seq_len)`, `optional`):
-                Mask for tokens at invalid position, such as query and special symbols (PAD, SEP, CLS).
-                1.0 means token should be masked.
+                Mask for tokens at invalid position, such as query and special symbols (PAD, SEP, CLS). 1.0 means token
+                should be masked.
 
         .. note::
 
@@ -1039,7 +1496,7 @@ class PoolerEndLogits(nn.Module):
         x = self.dense_1(x).squeeze(-1)
 
         if p_mask is not None:
-            if next(self.parameters()).dtype == torch.float16:
+            if get_parameter_dtype(self) == torch.float16:
                 x = x * (1 - p_mask) - 65500 * p_mask
             else:
                 x = x * (1 - p_mask) - 1e30 * p_mask
@@ -1117,13 +1574,15 @@ class SquadHeadOutput(ModelOutput):
 
     Args:
         loss (:obj:`torch.FloatTensor` of shape :obj:`(1,)`, `optional`, returned if both :obj:`start_positions` and :obj:`end_positions` are provided):
-            Classification loss as the sum of start token, end token (and is_impossible if provided) classification losses.
+            Classification loss as the sum of start token, end token (and is_impossible if provided) classification
+            losses.
         start_top_log_probs (``torch.FloatTensor`` of shape ``(batch_size, config.start_n_top)``, `optional`, returned if ``start_positions`` or ``end_positions`` is not provided):
             Log probabilities for the top config.start_n_top start token possibilities (beam-search).
         start_top_index (``torch.LongTensor`` of shape ``(batch_size, config.start_n_top)``, `optional`, returned if ``start_positions`` or ``end_positions`` is not provided):
             Indices for the top config.start_n_top start token possibilities (beam-search).
         end_top_log_probs (``torch.FloatTensor`` of shape ``(batch_size, config.start_n_top * config.end_n_top)``, `optional`, returned if ``start_positions`` or ``end_positions`` is not provided):
-            Log probabilities for the top ``config.start_n_top * config.end_n_top`` end token possibilities (beam-search).
+            Log probabilities for the top ``config.start_n_top * config.end_n_top`` end token possibilities
+            (beam-search).
         end_top_index (``torch.LongTensor`` of shape ``(batch_size, config.start_n_top * config.end_n_top)``, `optional`, returned if ``start_positions`` or ``end_positions`` is not provided):
             Indices for the top ``config.start_n_top * config.end_n_top`` end token possibilities (beam-search).
         cls_logits (``torch.FloatTensor`` of shape ``(batch_size,)``, `optional`, returned if ``start_positions`` or ``end_positions`` is not provided):
@@ -1170,24 +1629,24 @@ class SQuADHead(nn.Module):
         return_dict: bool = False,
     ) -> Union[SquadHeadOutput, Tuple[torch.FloatTensor]]:
         """
-    Args:
-        hidden_states (:obj:`torch.FloatTensor` of shape :obj:`(batch_size, seq_len, hidden_size)`):
-            Final hidden states of the model on the sequence tokens.
-        start_positions (:obj:`torch.LongTensor` of shape :obj:`(batch_size,)`, `optional`):
-            Positions of the first token for the labeled span.
-        end_positions (:obj:`torch.LongTensor` of shape :obj:`(batch_size,)`, `optional`):
-            Positions of the last token for the labeled span.
-        cls_index (:obj:`torch.LongTensor` of shape :obj:`(batch_size,)`, `optional`):
-            Position of the CLS token for each sentence in the batch. If :obj:`None`, takes the last token.
-        is_impossible (:obj:`torch.LongTensor` of shape :obj:`(batch_size,)`, `optional`):
-            Whether the question has a possible answer in the paragraph or not.
-        p_mask (:obj:`torch.FloatTensor` of shape :obj:`(batch_size, seq_len)`, `optional`):
-            Mask for tokens at invalid position, such as query and special symbols (PAD, SEP, CLS).
-            1.0 means token should be masked.
-        return_dict (:obj:`bool`, `optional`, defaults to :obj:`False`):
-            Whether or not to return a :class:`~transformers.file_utils.ModelOuput` instead of a plain tuple.
+        Args:
+            hidden_states (:obj:`torch.FloatTensor` of shape :obj:`(batch_size, seq_len, hidden_size)`):
+                Final hidden states of the model on the sequence tokens.
+            start_positions (:obj:`torch.LongTensor` of shape :obj:`(batch_size,)`, `optional`):
+                Positions of the first token for the labeled span.
+            end_positions (:obj:`torch.LongTensor` of shape :obj:`(batch_size,)`, `optional`):
+                Positions of the last token for the labeled span.
+            cls_index (:obj:`torch.LongTensor` of shape :obj:`(batch_size,)`, `optional`):
+                Position of the CLS token for each sentence in the batch. If :obj:`None`, takes the last token.
+            is_impossible (:obj:`torch.LongTensor` of shape :obj:`(batch_size,)`, `optional`):
+                Whether the question has a possible answer in the paragraph or not.
+            p_mask (:obj:`torch.FloatTensor` of shape :obj:`(batch_size, seq_len)`, `optional`):
+                Mask for tokens at invalid position, such as query and special symbols (PAD, SEP, CLS). 1.0 means token
+                should be masked.
+            return_dict (:obj:`bool`, `optional`, defaults to :obj:`False`):
+                Whether or not to return a :class:`~transformers.file_utils.ModelOutput` instead of a plain tuple.
 
-    Returns:
+        Returns:
         """
         start_logits = self.start_logits(hidden_states, p_mask=p_mask)
 
@@ -1219,7 +1678,7 @@ class SQuADHead(nn.Module):
         else:
             # during inference, compute the end logits based on beam search
             bsz, slen, hsz = hidden_states.size()
-            start_log_probs = F.softmax(start_logits, dim=-1)  # shape (bsz, slen)
+            start_log_probs = nn.functional.softmax(start_logits, dim=-1)  # shape (bsz, slen)
 
             start_top_log_probs, start_top_index = torch.topk(
                 start_log_probs, self.start_n_top, dim=-1
@@ -1233,7 +1692,7 @@ class SQuADHead(nn.Module):
             )  # shape (bsz, slen, start_n_top, hsz)
             p_mask = p_mask.unsqueeze(-1) if p_mask is not None else None
             end_logits = self.end_logits(hidden_states_expanded, start_states=start_states, p_mask=p_mask)
-            end_log_probs = F.softmax(end_logits, dim=1)  # shape (bsz, slen, start_n_top)
+            end_log_probs = nn.functional.softmax(end_logits, dim=1)  # shape (bsz, slen, start_n_top)
 
             end_top_log_probs, end_top_index = torch.topk(
                 end_log_probs, self.end_n_top, dim=1
@@ -1262,8 +1721,8 @@ class SequenceSummary(nn.Module):
 
     Args:
         config (:class:`~transformers.PretrainedConfig`):
-            The config used by the model. Relevant arguments in the config class of the model are (refer to the
-            actual config class of your model for the default values it uses):
+            The config used by the model. Relevant arguments in the config class of the model are (refer to the actual
+            config class of your model for the default values it uses):
 
             - **summary_type** (:obj:`str`) -- The method to use to make this summary. Accepted values are:
 
@@ -1276,7 +1735,7 @@ class SequenceSummary(nn.Module):
             - **summary_use_proj** (:obj:`bool`) -- Add a projection after the vector extraction.
             - **summary_proj_to_labels** (:obj:`bool`) -- If :obj:`True`, the projection outputs to
               :obj:`config.num_labels` classes (otherwise to :obj:`config.hidden_size`).
-            - **summary_activation**  (:obj:`Optional[str]`) -- Set to :obj:`"tanh"` to add a tanh activation to the
+            - **summary_activation** (:obj:`Optional[str]`) -- Set to :obj:`"tanh"` to add a tanh activation to the
               output, another string or :obj:`None` will add no activation.
             - **summary_first_dropout** (:obj:`float`) -- Optional dropout probability before the projection and
               activation.
@@ -1303,7 +1762,7 @@ class SequenceSummary(nn.Module):
             self.summary = nn.Linear(config.hidden_size, num_classes)
 
         activation_string = getattr(config, "summary_activation", None)
-        self.activation: Callable = (get_activation(activation_string) if activation_string else Identity())
+        self.activation: Callable = get_activation(activation_string) if activation_string else Identity()
 
         self.first_dropout = Identity()
         if hasattr(config, "summary_first_dropout") and config.summary_first_dropout > 0:
@@ -1337,7 +1796,11 @@ class SequenceSummary(nn.Module):
             output = hidden_states.mean(dim=1)
         elif self.summary_type == "cls_index":
             if cls_index is None:
-                cls_index = torch.full_like(hidden_states[..., :1, :], hidden_states.shape[-2] - 1, dtype=torch.long,)
+                cls_index = torch.full_like(
+                    hidden_states[..., :1, :],
+                    hidden_states.shape[-2] - 1,
+                    dtype=torch.long,
+                )
             else:
                 cls_index = cls_index.unsqueeze(-1).unsqueeze(-1)
                 cls_index = cls_index.expand((-1,) * (cls_index.dim() - 1) + (hidden_states.size(-1),))
@@ -1354,7 +1817,21 @@ class SequenceSummary(nn.Module):
         return output
 
 
-def prune_linear_layer(layer: torch.nn.Linear, index: torch.LongTensor, dim: int = 0) -> torch.nn.Linear:
+def unwrap_model(model: nn.Module) -> nn.Module:
+    """
+    Recursively unwraps a model from potential containers (as used in distributed training).
+
+    Args:
+        model (:obj:`torch.nn.Module`): The model to unwrap.
+    """
+    # since there could be multiple levels of wrapping, unwrap recursively
+    if hasattr(model, "module"):
+        return unwrap_model(model.module)
+    else:
+        return model
+
+
+def prune_linear_layer(layer: nn.Linear, index: torch.LongTensor, dim: int = 0) -> nn.Linear:
     """
     Prune a linear layer to keep only entries in index.
 
@@ -1422,8 +1899,8 @@ def prune_conv1d_layer(layer: Conv1D, index: torch.LongTensor, dim: int = 1) -> 
 
 
 def prune_layer(
-    layer: Union[torch.nn.Linear, Conv1D], index: torch.LongTensor, dim: Optional[int] = None
-) -> Union[torch.nn.Linear, Conv1D]:
+    layer: Union[nn.Linear, Conv1D], index: torch.LongTensor, dim: Optional[int] = None
+) -> Union[nn.Linear, Conv1D]:
     """
     Prune a Conv1D or linear layer to keep only entries in index.
 
@@ -1435,19 +1912,19 @@ def prune_layer(
         dim (:obj:`int`, `optional`): The dimension on which to keep the indices.
 
     Returns:
-        :obj:`torch.nn.Linear` or :class:`~transformers.modeling_utils.Conv1D`:
-        The pruned layer as a new layer with :obj:`requires_grad=True`.
+        :obj:`torch.nn.Linear` or :class:`~transformers.modeling_utils.Conv1D`: The pruned layer as a new layer with
+        :obj:`requires_grad=True`.
     """
     if isinstance(layer, nn.Linear):
         return prune_linear_layer(layer, index, dim=0 if dim is None else dim)
     elif isinstance(layer, Conv1D):
         return prune_conv1d_layer(layer, index, dim=1 if dim is None else dim)
     else:
-        raise ValueError("Can't prune layer of class {}".format(layer.__class__))
+        raise ValueError(f"Can't prune layer of class {layer.__class__}")
 
 
 def apply_chunking_to_forward(
-    chunk_size: int, chunk_dim: int, forward_fn: Callable[..., torch.Tensor], *input_tensors
+    forward_fn: Callable[..., torch.Tensor], chunk_size: int, chunk_dim: int, *input_tensors
 ) -> torch.Tensor:
     """
     This function chunks the :obj:`input_tensors` into smaller input tensor parts of size :obj:`chunk_size` over the
@@ -1457,16 +1934,17 @@ def apply_chunking_to_forward(
     directly applying :obj:`forward_fn` to :obj:`input_tensors`.
 
     Args:
+        forward_fn (:obj:`Callable[..., torch.Tensor]`):
+            The forward function of the model.
         chunk_size (:obj:`int`):
             The chunk size of a chunked tensor: :obj:`num_chunks = len(input_tensors[0]) / chunk_size`.
         chunk_dim (:obj:`int`):
             The dimension over which the :obj:`input_tensors` should be chunked.
-        forward_fn (:obj:`Callable[..., torch.Tensor]`):
-            The forward function of the model.
         input_tensors (:obj:`Tuple[torch.Tensor]`):
-            The input tensors of ``forward_fn`` which will be chunked.
+            The input tensors of ``forward_fn`` which will be chunked
+
     Returns:
-        :obj:`torch.Tensor`: A tensor with the same shape as the :obj:`foward_fn` would have given if applied`.
+        :obj:`torch.Tensor`: A tensor with the same shape as the :obj:`forward_fn` would have given if applied`.
 
 
     Examples::
@@ -1478,29 +1956,29 @@ def apply_chunking_to_forward(
 
         # implement a chunked forward function
         def forward(self, hidden_states):
-            return apply_chunking_to_forward(self.chunk_size_lm_head, self.seq_len_dim, self.forward_chunk, hidden_states)
+            return apply_chunking_to_forward(self.forward_chunk, self.chunk_size_lm_head, self.seq_len_dim, hidden_states)
     """
 
-    assert len(input_tensors) > 0, "{} has to be a tuple/list of tensors".format(input_tensors)
-    tensor_shape = input_tensors[0].shape
+    assert len(input_tensors) > 0, f"{input_tensors} has to be a tuple/list of tensors"
+    tensor_shape = input_tensors[0].shape[chunk_dim]
     assert all(
-        input_tensor.shape == tensor_shape for input_tensor in input_tensors
+        input_tensor.shape[chunk_dim] == tensor_shape for input_tensor in input_tensors
     ), "All input tenors have to be of the same shape"
 
-    # inspect.signature exist since python 3.5 and is a python method -> no problem with backward compability
+    # inspect.signature exist since python 3.5 and is a python method -> no problem with backward compatibility
     num_args_in_forward_chunk_fn = len(inspect.signature(forward_fn).parameters)
-    assert num_args_in_forward_chunk_fn == len(
-        input_tensors
-    ), "forward_chunk_fn expects {} arguments, but only {} input tensors are given".format(
-        num_args_in_forward_chunk_fn, len(input_tensors)
-    )
+    if num_args_in_forward_chunk_fn != len(input_tensors):
+        raise ValueError(
+            f"forward_chunk_fn expects {num_args_in_forward_chunk_fn} arguments, but only {len(input_tensors)} input "
+            "tensors are given"
+        )
 
     if chunk_size > 0:
-        assert (
-            input_tensors[0].shape[chunk_dim] % chunk_size == 0
-        ), "The dimension to be chunked {} has to be a multiple of the chunk size {}".format(
-            input_tensors[0].shape[chunk_dim], chunk_size
-        )
+        if input_tensors[0].shape[chunk_dim] % chunk_size != 0:
+            raise ValueError(
+                f"The dimension to be chunked {input_tensors[0].shape[chunk_dim]} has to be a multiple of the chunk "
+                f"size {chunk_size}"
+            )
 
         num_chunks = input_tensors[0].shape[chunk_dim] // chunk_size
 

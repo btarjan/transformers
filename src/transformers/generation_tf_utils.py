@@ -14,30 +14,31 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import logging
-
 import numpy as np
 import tensorflow as tf
 
+from .utils import logging
 
-logger = logging.getLogger(__name__)
+
+logger = logging.get_logger(__name__)
 
 
 class TFGenerationMixin:
     """
-    A class contraining all of the functions supporting generation, to be used as a mixin in
-    :class:`~transfomers.TFPreTrainedModel`.
+    A class containing all of the functions supporting generation, to be used as a mixin in
+    :class:`~transformers.TFPreTrainedModel`.
     """
 
     def prepare_inputs_for_generation(self, inputs, **kwargs):
         """
-        Implement in subclasses of :class:`~transfomers.TFPreTrainedModel` for custom behavior to prepare inputs in the
-        generate method.
+        Implement in subclasses of :class:`~transformers.TFPreTrainedModel` for custom behavior to prepare inputs in
+        the generate method.
         """
-        return {"inputs": inputs}
+        return {"input_ids": inputs}
 
     def _use_cache(self, outputs, use_cache):
         """During generation, decide whether to pass the `past` variable to the next forward pass."""
+        use_cache = getattr(self.config, "use_cache", False)
         if len(outputs) <= 1 or use_cache is False:
             return False
         if hasattr(self.config, "mem_len") and self.config.mem_len == 0:
@@ -66,6 +67,8 @@ class TFGenerationMixin:
         attention_mask=None,
         decoder_start_token_id=None,
         use_cache=None,
+        forced_bos_token_id=None,
+        forced_eos_token_id=None,
     ):
         r"""
         Generates sequences for models with a language modeling head. The method currently supports greedy decoding,
@@ -84,8 +87,8 @@ class TFGenerationMixin:
         Parameters:
 
             input_ids (:obj:`tf.Tensor` of :obj:`dtype=tf.int32` and shape :obj:`(batch_size, sequence_length)`, `optional`):
-                The sequence used as a prompt for the generation. If :obj:`None` the method initializes
-                it as an empty :obj:`tf.Tensor` of shape :obj:`(1,)`.
+                The sequence used as a prompt for the generation. If :obj:`None` the method initializes it as an empty
+                :obj:`tf.Tensor` of shape :obj:`(1,)`.
             max_length (:obj:`int`, `optional`, defaults to 20):
                 The maximum length of the sequence to be generated.
             min_length (:obj:`int`, `optional`, defaults to 10):
@@ -96,7 +99,7 @@ class TFGenerationMixin:
                 Whether to stop the beam search when at least ``num_beams`` sentences are finished per batch or not.
             num_beams (:obj:`int`, `optional`, defaults to 1):
                 Number of beams for beam search. 1 means no beam search.
-            temperature (:obj:`float`, `optional`, defaults tp 1.0):
+            temperature (:obj:`float`, `optional`, defaults to 1.0):
                 The value used to module the next token probabilities.
             top_k (:obj:`int`, `optional`, defaults to 50):
                 The number of highest probability vocabulary tokens to keep for top-k-filtering.
@@ -136,48 +139,54 @@ class TFGenerationMixin:
             use_cache: (:obj:`bool`, `optional`, defaults to :obj:`True`):
                 Whether or not the model should use the past last key/values attentions (if applicable to the model) to
                 speed up decoding.
+            forced_bos_token_id (:obj:`int`, `optional`):
+                The id of the token to force as the first generated token after the :obj:`decoder_start_token_id`.
+                Useful for multilingual models like :doc:`mBART <../model_doc/mbart>` where the first generated token
+                needs to be the target language token.
+            forced_eos_token_id (:obj:`int`, `optional`):
+                The id of the token to force as the last generated token when :obj:`max_length` is reached.
             model_specific_kwargs:
                 Additional model specific kwargs will be forwarded to the :obj:`forward` function of the model.
 
         Return:
 
-            :obj:`tf.Tensor` of :obj:`dtype=tf.int32` and shape :obj:`(batch_size * num_return_sequences, sequence_length)`:
-            The generated sequences. The second dimension (sequence_length) is either equal to :obj:`max_length` or
-            shorter if all batches finished early due to the :obj:`eos_token_id`.
+            :obj:`tf.Tensor` of :obj:`dtype=tf.int32` and shape :obj:`(batch_size * num_return_sequences,
+            sequence_length)`: The generated sequences. The second dimension (sequence_length) is either equal to
+            :obj:`max_length` or shorter if all batches finished early due to the :obj:`eos_token_id`.
 
         Examples::
 
             tokenizer = AutoTokenizer.from_pretrained('distilgpt2')   # Initialize tokenizer
-            model = TFAutoModelWithLMHead.from_pretrained('distilgpt2')    # Download model and configuration from S3 and cache.
+            model = TFAutoModelWithLMHead.from_pretrained('distilgpt2')    # Download model and configuration from huggingface.co and cache.
             outputs = model.generate(max_length=40)  # do greedy decoding
-            print('Generated: {}'.format(tokenizer.decode(outputs[0], skip_special_tokens=True)))
+            print(f'Generated: {tokenizer.decode(outputs[0], skip_special_tokens=True)}')
 
             tokenizer = AutoTokenizer.from_pretrained('openai-gpt')   # Initialize tokenizer
-            model = TFAutoModelWithLMHead.from_pretrained('openai-gpt')    # Download model and configuration from S3 and cache.
+            model = TFAutoModelWithLMHead.from_pretrained('openai-gpt')    # Download model and configuration from huggingface.co and cache.
             input_context = 'The dog'
             input_ids = tokenizer.encode(input_context, return_tensors='tf')  # encode input context
             outputs = model.generate(input_ids=input_ids, num_beams=5, num_return_sequences=3, temperature=1.5)  # generate 3 independent sequences using beam search decoding (5 beams) with sampling from initial context 'The dog'
             for i in range(3): #  3 output sequences were generated
-                print('Generated {}: {}'.format(i, tokenizer.decode(outputs[i], skip_special_tokens=True)))
+                print(f'Generated {i}: {tokenizer.decode(outputs[i], skip_special_tokens=True)}')
 
             tokenizer = AutoTokenizer.from_pretrained('distilgpt2')   # Initialize tokenizer
-            model = TFAutoModelWithLMHead.from_pretrained('distilgpt2')    # Download model and configuration from S3 and cache.
+            model = TFAutoModelWithLMHead.from_pretrained('distilgpt2')    # Download model and configuration from huggingface.co and cache.
             input_context = 'The dog'
             input_ids = tokenizer.encode(input_context, return_tensors='tf')  # encode input context
             outputs = model.generate(input_ids=input_ids, max_length=40, temperature=0.7, num_return_sequences=3, do_sample=True)  # generate 3 candidates using sampling
             for i in range(3): #  3 output sequences were generated
-                print('Generated {}: {}'.format(i, tokenizer.decode(outputs[i], skip_special_tokens=True)))
+                print(f'Generated {i}: {tokenizer.decode(outputs[i], skip_special_tokens=True)}')
 
             tokenizer = AutoTokenizer.from_pretrained('ctrl')   # Initialize tokenizer
-            model = TFAutoModelWithLMHead.from_pretrained('ctrl')    # Download model and configuration from S3 and cache.
+            model = TFAutoModelWithLMHead.from_pretrained('ctrl')    # Download model and configuration from huggingface.co and cache.
             input_context = 'Legal My neighbor is'  # "Legal" is one of the control codes for ctrl
             input_ids = tokenizer.encode(input_context, return_tensors='tf')  # encode input context
             outputs = model.generate(input_ids=input_ids, max_length=50, temperature=0.7, repetition_penalty=1.2)  # generate sequences
-            print('Generated: {}'.format(tokenizer.decode(outputs[0], skip_special_tokens=True)))
+            print(f'Generated: {tokenizer.decode(outputs[0], skip_special_tokens=True)}')
 
             tokenizer = AutoTokenizer.from_pretrained('gpt2')   # Initialize tokenizer
-            model = TFAutoModelWithLMHead.from_pretrained('gpt2')    # Download model and configuration from S3 and cache.
-            input_context = 'My cute dog'  # "Legal" is one of the control codes for ctrl
+            model = TFAutoModelWithLMHead.from_pretrained('gpt2')    # Download model and configuration from huggingface.co and cache.
+            input_context = 'My cute dog'
             bad_words_ids = [tokenizer.encode(bad_word, add_prefix_space=True) for bad_word in ['idiot', 'stupid', 'shut up']]
             input_ids = tokenizer.encode(input_context, return_tensors='tf')  # encode input context
             outputs = model.generate(input_ids=input_ids, max_length=100, do_sample=True, bad_words_ids=bad_words_ids)  # generate sequences without allowing bad_words to be generated
@@ -194,7 +203,6 @@ class TFGenerationMixin:
         min_length = min_length if min_length is not None else self.config.min_length
         do_sample = do_sample if do_sample is not None else self.config.do_sample
         early_stopping = early_stopping if early_stopping is not None else self.config.early_stopping
-        use_cache = use_cache if use_cache is not None else self.config.use_cache
         num_beams = num_beams if num_beams is not None else self.config.num_beams
         temperature = temperature if temperature is not None else self.config.temperature
         top_k = top_k if top_k is not None else self.config.top_k
@@ -214,19 +222,24 @@ class TFGenerationMixin:
         decoder_start_token_id = (
             decoder_start_token_id if decoder_start_token_id is not None else self.config.decoder_start_token_id
         )
+        forced_bos_token_id = (
+            forced_bos_token_id if forced_bos_token_id is not None else self.config.forced_bos_token_id
+        )
+        forced_eos_token_id = (
+            forced_eos_token_id if forced_eos_token_id is not None else self.config.forced_eos_token_id
+        )
 
         if input_ids is not None:
-            batch_size = shape_list(input_ids)[0]  # overriden by the input batch_size
+            batch_size = shape_list(input_ids)[0]  # overridden by the input batch_size
         else:
             batch_size = 1
 
-        assert isinstance(max_length, int) and max_length > 0, "`max_length` should be a strictely positive integer."
+        assert isinstance(max_length, int) and max_length > 0, "`max_length` should be a strictly positive integer."
         assert isinstance(min_length, int) and min_length >= 0, "`min_length` should be a positive integer."
         assert isinstance(do_sample, bool), "`do_sample` should be a boolean."
         assert isinstance(early_stopping, bool), "`early_stopping` should be a boolean."
-        assert isinstance(use_cache, bool), "`use_cache` should be a boolean."
-        assert isinstance(num_beams, int) and num_beams > 0, "`num_beams` should be a strictely positive integer."
-        assert temperature > 0, "`temperature` should be strictely positive."
+        assert isinstance(num_beams, int) and num_beams > 0, "`num_beams` should be a strictly positive integer."
+        assert temperature > 0, "`temperature` should be strictly positive."
         assert isinstance(top_k, int) and top_k >= 0, "`top_k` should be a positive integer."
         assert 0 <= top_p <= 1, "`top_p` should be between 0 and 1."
         assert repetition_penalty >= 1.0, "`repetition_penalty` should be >= 1."
@@ -239,10 +252,10 @@ class TFGenerationMixin:
         assert (eos_token_id is None) or (
             isinstance(eos_token_id, int) and (eos_token_id >= 0)
         ), "`eos_token_id` should be a positive integer."
-        assert length_penalty > 0, "`length_penalty` should be strictely positive."
+        assert length_penalty > 0, "`length_penalty` should be strictly positive."
         assert (
             isinstance(num_return_sequences, int) and num_return_sequences > 0
-        ), "`num_return_sequences` should be a strictely positive integer."
+        ), "`num_return_sequences` should be a strictly positive integer."
         assert (
             bad_words_ids is None or isinstance(bad_words_ids, list) and isinstance(bad_words_ids[0], list)
         ), "`bad_words_ids` is either `None` or a list of lists of tokens that should not be generated"
@@ -278,13 +291,11 @@ class TFGenerationMixin:
             attention_mask = tf.ones_like(input_ids)
 
         if pad_token_id is None and eos_token_id is not None:
-            logger.warning(
-                "Setting `pad_token_id` to {} (first `eos_token_id`) to generate sequence".format(eos_token_id)
-            )
+            logger.warning(f"Setting `pad_token_id` to {eos_token_id} (first `eos_token_id`) to generate sequence")
             pad_token_id = eos_token_id
 
         # current position and vocab size
-        cur_len = shape_list(input_ids)[1]
+        cur_len = shape_list(input_ids)[1]  # unused
         vocab_size = self.config.vocab_size
 
         # set effective batch size and effective batch multiplier according to do_sample
@@ -302,8 +313,8 @@ class TFGenerationMixin:
             assert (
                 decoder_start_token_id is not None
             ), "decoder_start_token_id or bos_token_id has to be defined for encoder-decoder generation"
-            assert hasattr(self, "get_encoder"), "{} should have a 'get_encoder' function defined".format(self)
-            assert callable(self.get_encoder), "{} should be a method".format(self.get_encoder)
+            assert hasattr(self, "get_encoder"), f"{self} should have a 'get_encoder' function defined"
+            assert callable(self.get_encoder), f"{self.get_encoder} should be a method"
 
             # get encoder and store encoder outputs
             encoder = self.get_encoder()
@@ -329,7 +340,13 @@ class TFGenerationMixin:
         if self.config.is_encoder_decoder:
 
             # create empty decoder_input_ids
-            input_ids = tf.ones((effective_batch_size * num_beams, 1), dtype=tf.int32,) * decoder_start_token_id
+            input_ids = (
+                tf.ones(
+                    (effective_batch_size * num_beams, 1),
+                    dtype=tf.int32,
+                )
+                * decoder_start_token_id
+            )
             cur_len = 1
 
             assert (
@@ -342,8 +359,7 @@ class TFGenerationMixin:
                 shape=(-1,),
             )
             # expand encoder_outputs
-            encoder_outputs = (tf.gather(encoder_outputs[0], expanded_batch_idxs, axis=0), *encoder_outputs[1:])
-
+            encoder_outputs = (tf.gather(encoder_outputs[0], expanded_batch_idxs, axis=0),)
         else:
             encoder_outputs = None
             cur_len = shape_list(input_ids)[-1]
@@ -366,10 +382,8 @@ class TFGenerationMixin:
                 repetition_penalty=repetition_penalty,
                 no_repeat_ngram_size=no_repeat_ngram_size,
                 bad_words_ids=bad_words_ids,
-                bos_token_id=bos_token_id,
                 pad_token_id=pad_token_id,
                 eos_token_id=eos_token_id,
-                decoder_start_token_id=decoder_start_token_id,
                 batch_size=effective_batch_size,
                 num_return_sequences=num_return_sequences,
                 length_penalty=length_penalty,
@@ -378,6 +392,8 @@ class TFGenerationMixin:
                 encoder_outputs=encoder_outputs,
                 attention_mask=attention_mask,
                 use_cache=use_cache,
+                forced_bos_token_id=forced_bos_token_id,
+                forced_eos_token_id=forced_eos_token_id,
             )
         else:
             output = self._generate_no_beam_search(
@@ -392,10 +408,8 @@ class TFGenerationMixin:
                 repetition_penalty=repetition_penalty,
                 no_repeat_ngram_size=no_repeat_ngram_size,
                 bad_words_ids=bad_words_ids,
-                bos_token_id=bos_token_id,
                 pad_token_id=pad_token_id,
                 eos_token_id=eos_token_id,
-                decoder_start_token_id=decoder_start_token_id,
                 batch_size=effective_batch_size,
                 vocab_size=vocab_size,
                 encoder_outputs=encoder_outputs,
@@ -418,18 +432,18 @@ class TFGenerationMixin:
         repetition_penalty,
         no_repeat_ngram_size,
         bad_words_ids,
-        bos_token_id,
         pad_token_id,
         eos_token_id,
-        decoder_start_token_id,
         batch_size,
         vocab_size,
         encoder_outputs,
         attention_mask,
         use_cache,
+        **kwargs
     ):
-        """ Generate sequences for each example without beam search (num_beams == 1).
-            All returned sequence are generated independantly.
+        """
+        Generate sequences for each example without beam search (num_beams == 1). All returned sequences are generated
+        independently.
         """
 
         # length of generated sentences / unfinished sentences
@@ -440,7 +454,7 @@ class TFGenerationMixin:
 
         while cur_len < max_length:
             model_inputs = self.prepare_inputs_for_generation(
-                input_ids, past=past, attention_mask=attention_mask, use_cache=use_cache
+                input_ids, past=past, attention_mask=attention_mask, use_cache=use_cache, **kwargs
             )
             outputs = self(**model_inputs)
             next_token_logits = outputs[0][:, -1, :]
@@ -536,7 +550,7 @@ class TFGenerationMixin:
                 # unfinished_sents is set to zero if eos in sentence
                 unfinished_sents -= is_sents_unfinished_and_token_to_add_is_eos
 
-            # stop when there is a </s> in each sentence, or if we exceed the maximul length
+            # stop when there is a </s> in each sentence, or if we exceed the maximum length
             if tf.math.reduce_max(unfinished_sents) == 0:
                 break
 
@@ -582,9 +596,7 @@ class TFGenerationMixin:
         repetition_penalty,
         no_repeat_ngram_size,
         bad_words_ids,
-        bos_token_id,
         pad_token_id,
-        decoder_start_token_id,
         eos_token_id,
         batch_size,
         num_return_sequences,
@@ -594,9 +606,11 @@ class TFGenerationMixin:
         encoder_outputs,
         attention_mask,
         use_cache,
+        forced_bos_token_id,
+        forced_eos_token_id,
+        **kwargs,
     ):
-        """ Generate sequences for each example with beam search.
-        """
+        """Generate sequences for each example with beam search."""
 
         # generated hypotheses
         generated_hyps = [
@@ -616,13 +630,14 @@ class TFGenerationMixin:
 
         # cache compute states
         past = encoder_outputs
+        # to stay similar to torch : past = (encoder_outputs, None) if encoder_outputs is not None else None
 
         # done sentences
         done = [False for _ in range(batch_size)]
 
         while cur_len < max_length:
             model_inputs = self.prepare_inputs_for_generation(
-                input_ids, past=past, attention_mask=attention_mask, use_cache=use_cache
+                input_ids, past=past, attention_mask=attention_mask, use_cache=use_cache, **kwargs
             )
             outputs = self(**model_inputs)  # (batch_size * num_beams, cur_len, vocab_size)
             next_token_logits = outputs[0][:, -1, :]  # (batch_size * num_beams, vocab_size)
@@ -642,6 +657,14 @@ class TFGenerationMixin:
             if temperature != 1.0:
                 next_token_logits = next_token_logits / temperature
 
+            if self.config.is_encoder_decoder and do_sample is False:
+                next_token_logits = self.adjust_logits_during_generation(
+                    next_token_logits,
+                    cur_len=cur_len,
+                    max_length=max_length,
+                    forced_bos_token_id=forced_bos_token_id,
+                    forced_eos_token_id=forced_eos_token_id,
+                )
             #             calculate log softmax score
             scores = tf.nn.log_softmax(next_token_logits, axis=-1)  # (batch_size * num_beams, vocab_size)
 
@@ -719,7 +742,7 @@ class TFGenerationMixin:
                     beam_scores[:, None], (batch_size * num_beams, vocab_size)
                 )  # (batch_size * num_beams, vocab_size)
 
-                # re-organize to group the beam together (we are keeping top hypothesis accross beams)
+                # re-organize to group the beam together (we are keeping top hypothesis across beams)
                 next_scores = tf.reshape(
                     next_scores, (batch_size, num_beams * vocab_size)
                 )  # (batch_size, num_beams * vocab_size)
@@ -738,7 +761,7 @@ class TFGenerationMixin:
                 if done[batch_idx]:
                     assert (
                         len(generated_hyps[batch_idx]) >= num_beams
-                    ), "Batch can only be done if at least {} beams have been generated".format(num_beams)
+                    ), f"Batch can only be done if at least {num_beams} beams have been generated."
                     assert (
                         eos_token_id is not None and pad_token_id is not None
                     ), "generated beams >= num_beams -> eos_token_id and pad_token have to be defined"
@@ -818,12 +841,14 @@ class TFGenerationMixin:
             if eos_token_id is not None and all(
                 (token_id % vocab_size).numpy().item() != eos_token_id for token_id in next_tokens[batch_idx]
             ):
-                assert tf.reduce_all(
+                if not tf.reduce_all(
                     next_scores[batch_idx, :num_beams] == tf.reshape(beam_scores, (batch_size, num_beams))[batch_idx]
-                ), "If batch_idx is not done, final next scores: {} have to equal to accumulated beam_scores: {}".format(
-                    next_scores[:, :num_beams][batch_idx], tf.reshape(beam_scores, (batch_size, num_beams))[batch_idx]
-                )
-
+                ):
+                    raise ValueError(
+                        f"If batch_idx is not done, final next scores: {next_scores[:, :num_beams][batch_idx]} have "
+                        "to equal to accumulated beam_scores: "
+                        f"{tf.reshape(beam_scores, (batch_size, num_beams))[batch_idx]}"
+                    )
             # need to add best num_beams hypotheses to generated hyps
             for beam_id in range(num_beams):
                 effective_beam_id = batch_idx * num_beams + beam_id
@@ -846,9 +871,9 @@ class TFGenerationMixin:
                 best_hyp = sorted_hyps.pop()[1]
                 sent_lengths_list.append(len(best_hyp))
                 best.append(best_hyp)
-        assert output_batch_size == len(best), "Output batch size {} must match output beam hypotheses {}".format(
-            output_batch_size, len(best)
-        )
+        assert output_batch_size == len(
+            best
+        ), f"Output batch size {output_batch_size} must match output beam hypotheses {len(best)}"
 
         sent_lengths = tf.convert_to_tensor(sent_lengths_list, dtype=tf.int32)
 
@@ -892,6 +917,22 @@ class TFGenerationMixin:
     def _reorder_cache(past, beam_idx):
         return tuple(tf.gather(layer_past, beam_idx, axis=1) for layer_past in past)
 
+    def adjust_logits_during_generation(
+        self, logits, cur_len, max_length, forced_bos_token_id, forced_eos_token_id, **kwargs
+    ):
+        """
+        Implement in subclasses of :class:`~transformers.PreTrainedModel` for custom behavior to adjust the logits in
+        the generate method.
+        """
+        if cur_len == 1 and forced_bos_token_id is not None:
+            vocab_range = tf.constant(range(self.config.vocab_size))
+            return tf.where(vocab_range != forced_bos_token_id, -1e8, logits)
+        elif cur_len == max_length - 1 and forced_eos_token_id is not None:
+            vocab_range = tf.constant(range(self.config.vocab_size))
+            return tf.where(vocab_range != forced_eos_token_id, -1e8, logits)
+        else:
+            return logits
+
 
 def _create_next_token_logits_penalties(input_ids, logits, repetition_penalty):
     # create logit penalties for already seen input_ids
@@ -908,7 +949,7 @@ def _create_next_token_logits_penalties(input_ids, logits, repetition_penalty):
 
 
 def calc_banned_ngram_tokens(prev_input_ids, num_hypos, no_repeat_ngram_size, cur_len):
-    # Copied from fairseq for no_repeat_ngram in beam_search"""
+    # Copied from fairseq for no_repeat_ngram in beam_search
     if cur_len + 1 < no_repeat_ngram_size:
         # return no banned tokens if we haven't generated no_repeat_ngram_size tokens yet
         return [[] for _ in range(num_hypos)]
@@ -951,9 +992,9 @@ def calc_banned_bad_words_ids(prev_input_ids, bad_words_ids):
         banned_tokens_slice = []
 
         for banned_token_seq in bad_words_ids:
-            assert len(banned_token_seq) > 0, "Banned words token sequences {} cannot have an empty list".format(
-                bad_words_ids
-            )
+            assert (
+                len(banned_token_seq) > 0
+            ), f"Banned words token sequences { bad_words_ids} cannot have an empty list"
 
             if _tokens_match(prev_input_ids_slice.numpy().tolist(), banned_token_seq[:-1]) is False:
                 # if tokens do not match continue
@@ -967,14 +1008,16 @@ def calc_banned_bad_words_ids(prev_input_ids, bad_words_ids):
 
 
 def tf_top_k_top_p_filtering(logits, top_k=0, top_p=1.0, filter_value=-float("Inf"), min_tokens_to_keep=1):
-    """ Filter a distribution of logits using top-k and/or nucleus (top-p) filtering
-        Args:
-            logits: logits distribution shape (batch size, vocabulary size)
-            if top_k > 0: keep only top k tokens with highest probability (top-k filtering).
-            if top_p < 1.0: keep the top tokens with cumulative probability >= top_p (nucleus filtering).
-                Nucleus filtering is described in Holtzman et al. (http://arxiv.org/abs/1904.09751)
-            Make sure we keep at least min_tokens_to_keep per batch example in the output
-        From: https://gist.github.com/thomwolf/1a5a29f6962089e871b94cbd09daf317
+    """
+    Filter a distribution of logits using top-k and/or nucleus (top-p) filtering
+
+    Args:
+        logits: logits distribution shape (batch size, vocabulary size)
+        if top_k > 0: keep only top k tokens with highest probability (top-k filtering).
+        if top_p < 1.0: keep the top tokens with cumulative probability >= top_p (nucleus filtering).
+            Nucleus filtering is described in Holtzman et al. (http://arxiv.org/abs/1904.09751)
+        Make sure we keep at least min_tokens_to_keep per batch example in the output
+    From: https://gist.github.com/thomwolf/1a5a29f6962089e871b94cbd09daf317
     """
     logits_shape = shape_list(logits)
 
@@ -1008,7 +1051,8 @@ def tf_top_k_top_p_filtering(logits, top_k=0, top_p=1.0, filter_value=-float("In
         # Shift the indices to the right to keep also the first token above the threshold
         sorted_indices_to_remove = tf.roll(sorted_indices_to_remove, 1, axis=-1)
         sorted_indices_to_remove = tf.concat(
-            [tf.zeros_like(sorted_indices_to_remove[:, :1]), sorted_indices_to_remove[:, 1:]], -1,
+            [tf.zeros_like(sorted_indices_to_remove[:, :1]), sorted_indices_to_remove[:, 1:]],
+            -1,
         )
         # scatter sorted tensors to original indexing
         indices_to_remove = scatter_values_on_batch_indices(sorted_indices_to_remove, sorted_indices)
@@ -1034,9 +1078,8 @@ def set_tensor_by_indices_to_value(tensor, indices, value):
 
 def sample_without_replacement(logits, num_samples):
     """
-        categorical sampling witouth replacement is currently not implemented
-        the gumbel-max trick will do for now
-        see https://github.com/tensorflow/tensorflow/issues/9260 for more info
+    categorical sampling without replacement is currently not implemented the gumbel-max trick will do for now see
+    https://github.com/tensorflow/tensorflow/issues/9260 for more info
     """
     z = -tf.math.log(tf.random.uniform(shape_list(logits), 0, 1))
     _, indices = tf.nn.top_k(logits + z, num_samples)
@@ -1084,8 +1127,8 @@ class BeamHypotheses(object):
 
     def is_done(self, best_sum_logprobs, cur_len):
         """
-        If there are enough hypotheses and that none of the hypotheses being generated
-        can become better than the worst one in the heap, then we are done with this sentence.
+        If there are enough hypotheses and that none of the hypotheses being generated can become better than the worst
+        one in the heap, then we are done with this sentence.
         """
 
         if len(self) < self.num_beams:
