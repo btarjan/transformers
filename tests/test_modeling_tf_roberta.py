@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2018 The Google AI Language Team Authors.
+# Copyright 2020 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,29 +17,31 @@
 import unittest
 
 from transformers import RobertaConfig, is_tf_available
-from transformers.testing_utils import require_tf, slow
+from transformers.testing_utils import require_sentencepiece, require_tf, require_tokenizers, slow
 
 from .test_configuration_common import ConfigTester
 from .test_modeling_tf_common import TFModelTesterMixin, ids_tensor
 
 
 if is_tf_available():
-    import tensorflow as tf
     import numpy
-    from transformers.modeling_tf_roberta import (
-        TFRobertaModel,
+    import tensorflow as tf
+
+    from transformers.models.roberta.modeling_tf_roberta import (
+        TF_ROBERTA_PRETRAINED_MODEL_ARCHIVE_LIST,
         TFRobertaForMaskedLM,
+        TFRobertaForMultipleChoice,
+        TFRobertaForQuestionAnswering,
         TFRobertaForSequenceClassification,
         TFRobertaForTokenClassification,
-        TFRobertaForQuestionAnswering,
-        TFRobertaForMultipleChoice,
-        TF_ROBERTA_PRETRAINED_MODEL_ARCHIVE_LIST,
+        TFRobertaModel,
     )
 
 
 class TFRobertaModelTester:
     def __init__(
-        self, parent,
+        self,
+        parent,
     ):
         self.parent = parent
         self.batch_size = 13
@@ -95,7 +97,6 @@ class TFRobertaModelTester:
             max_position_embeddings=self.max_position_embeddings,
             type_vocab_size=self.type_vocab_size,
             initializer_range=self.initializer_range,
-            return_dict=True,
         )
 
         return config, input_ids, token_type_ids, input_mask, sequence_labels, token_labels, choice_labels
@@ -184,6 +185,8 @@ class TFRobertaModelTest(TFModelTesterMixin, unittest.TestCase):
         if is_tf_available()
         else ()
     )
+    test_head_masking = False
+    test_onnx = False
 
     def setUp(self):
         self.model_tester = TFRobertaModelTester(self)
@@ -220,6 +223,8 @@ class TFRobertaModelTest(TFModelTesterMixin, unittest.TestCase):
 
 
 @require_tf
+@require_sentencepiece
+@require_tokenizers
 class TFRobertaModelIntegrationTest(unittest.TestCase):
     @slow
     def test_inference_masked_lm(self):
