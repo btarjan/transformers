@@ -23,6 +23,13 @@
           </advancedOptions>
         </fileTransfer>
       </webServer>
+      <webServer id="e64655d8-dae2-4d5c-9eb9-12d128ca340b" name="tarjanb_gpubuntu">
+        <fileTransfer rootFolder="/home/tarjanb" accessType="SFTP" host="speechtex.ddns.net" port="60222" sshConfigId="dbe472e0-961e-4a67-bbc5-731054e31b7f" sshConfig="tarjanb_gpubuntu">
+          <advancedOptions>
+            <advancedOptions dataProtectionLevel="Private" passiveMode="true" shareSSLContext="true" />
+          </advancedOptions>
+        </fileTransfer>
+      </webServer>
     </option>
   </component>
 </project>
