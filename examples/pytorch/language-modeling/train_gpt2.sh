@@ -6,8 +6,9 @@
 # --max_grad_norm 5
 # run_clm_no_trainer.py
 # epoch 20
+# reevaluate rerun model
 # --fp16
-## --fp16_opt_level 01
+# --fp16_opt_level 01
 
 train_gpt2() {
   python run_clm.py \
