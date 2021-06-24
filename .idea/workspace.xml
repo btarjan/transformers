@@ -1,0 +1,150 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="AutoImportSettings">
+    <option name="autoReloadType" value="SELECTIVE" />
+  </component>
+  <component name="ChangeListManager">
+    <list default="true" id="37ea0759-13cc-4653-a920-bcd264aec339" name="Default Changelist" comment="add initial version of gpt2 LM training script to my branch">
+      <change afterPath="$PROJECT_DIR$/examples/pytorch/language-modeling/run_language_modeling.py" afterDir="false" />
+    </list>
+    <list id="fceed033-2c40-436c-9440-1c8c60cf4016" name="markdown" comment="" />
+    <list id="bf9808ed-3bae-4605-8259-f75b5d67b190" name="symlink" comment="" />
+    <option name="SHOW_DIALOG" value="false" />
+    <option name="HIGHLIGHT_CONFLICTS" value="true" />
+    <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
+    <option name="LAST_RESOLUTION" value="IGNORE" />
+  </component>
+  <component name="Git.Settings">
+    <option name="RECENT_BRANCH_BY_REPOSITORY">
+      <map>
+        <entry key="$PROJECT_DIR$" value="btarjan_phd_exp" />
+      </map>
+    </option>
+    <option name="RECENT_GIT_ROOT_PATH" value="$PROJECT_DIR$" />
+  </component>
+  <component name="ProjectId" id="1tOZ0gQdFVpE72RQLPvrpwwRqLZ" />
+  <component name="ProjectLevelVcsManager" settingsEditedManually="true" />
+  <component name="ProjectViewState">
+    <option name="hideEmptyMiddlePackages" value="true" />
+    <option name="showLibraryContents" value="true" />
+  </component>
+  <component name="PropertiesComponent">
+    <property name="RunOnceActivity.OpenProjectViewOnStart" value="true" />
+    <property name="RunOnceActivity.ShowReadmeOnStart" value="true" />
+    <property name="WebServerToolWindowFactoryState" value="true" />
+    <property name="last_opened_file_path" value="$PROJECT_DIR$/../smartass" />
+    <property name="node.js.detected.package.eslint" value="true" />
+    <property name="node.js.selected.package.eslint" value="(autodetect)" />
+    <property name="settings.editor.selected.configurable" value="vcs.Git" />
+  </component>
+  <component name="RecentsManager">
+    <key name="MoveFile.RECENT_KEYS">
+      <recent name="D:\ubuntu_shared\transformers\examples\pytorch\language-modeling" />
+    </key>
+  </component>
+  <component name="SpellCheckerSettings" RuntimeDictionaries="0" Folders="0" CustomDictionaries="0" DefaultDictionary="application-level" UseSingleDictionary="true" transferred="true" />
+  <component name="SshConsoleOptionsProvider">
+    <option name="myEncoding" value="UTF-8" />
+    <option name="myConnectionType" value="NONE" />
+    <option name="myConnectionId" value="" />
+  </component>
+  <component name="SvnConfiguration">
+    <configuration>C:\Users\Balazs\AppData\Roaming\Subversion</configuration>
+  </component>
+  <component name="TaskManager">
+    <task active="true" id="Default" summary="Default task">
+      <changelist id="37ea0759-13cc-4653-a920-bcd264aec339" name="Default Changelist" comment="" />
+      <changelist id="fceed033-2c40-436c-9440-1c8c60cf4016" name="markdown" comment="" />
+      <changelist id="bf9808ed-3bae-4605-8259-f75b5d67b190" name="symlink" comment="" />
+      <created>1622641875522</created>
+      <option name="number" value="Default" />
+      <option name="presentableId" value="Default" />
+      <updated>1622641875522</updated>
+      <workItem from="1622641877848" duration="359000" />
+      <workItem from="1622642379055" duration="664000" />
+      <workItem from="1622643935317" duration="1956000" />
+      <workItem from="1622648815937" duration="232000" />
+      <workItem from="1622649066576" duration="1688000" />
+      <workItem from="1622658767057" duration="3443000" />
+      <workItem from="1622666187250" duration="3979000" />
+      <workItem from="1622709939900" duration="6713000" />
+      <workItem from="1622729869530" duration="1142000" />
+      <workItem from="1622800769447" duration="7437000" />
+      <workItem from="1622825846804" duration="21000" />
+      <workItem from="1624348851102" duration="9566000" />
+      <workItem from="1624436988796" duration="5470000" />
+      <workItem from="1624449453569" duration="3582000" />
+      <workItem from="1624454686362" duration="539000" />
+      <workItem from="1624456291600" duration="5604000" />
+      <workItem from="1624517019485" duration="639000" />
+    </task>
+    <task id="LOCAL-00001" summary="add rerun config to lm training scripts">
+      <created>1622815508139</created>
+      <option name="number" value="00001" />
+      <option name="presentableId" value="LOCAL-00001" />
+      <option name="project" value="LOCAL" />
+      <updated>1622815508139</updated>
+    </task>
+    <task id="LOCAL-00002" summary="add initial version of gpt2 LM training script to my branch">
+      <created>1624462928337</created>
+      <option name="number" value="00002" />
+      <option name="presentableId" value="LOCAL-00002" />
+      <option name="project" value="LOCAL" />
+      <updated>1624462928337</updated>
+    </task>
+    <option name="localTasksCounter" value="3" />
+    <servers />
+  </component>
+  <component name="TypeScriptGeneratedFilesManager">
+    <option name="version" value="3" />
+  </component>
+  <component name="Vcs.Log.Tabs.Properties">
+    <option name="TAB_STATES">
+      <map>
+        <entry key="MAIN">
+          <value>
+            <State>
+              <option name="FILTERS">
+                <map>
+                  <entry key="branch">
+                    <value>
+                      <list>
+                        <option value="HEAD" />
+                      </list>
+                    </value>
+                  </entry>
+                </map>
+              </option>
+            </State>
+          </value>
+        </entry>
+      </map>
+    </option>
+    <option name="RECENT_FILTERS">
+      <map>
+        <entry key="Branch">
+          <value>
+            <list>
+              <RecentGroup>
+                <option name="FILTER_VALUES">
+                  <option value="HEAD" />
+                </option>
+              </RecentGroup>
+              <RecentGroup>
+                <option name="FILTER_VALUES">
+                  <option value="master" />
+                </option>
+              </RecentGroup>
+            </list>
+          </value>
+        </entry>
+      </map>
+    </option>
+    <option name="oldMeFiltersMigrated" value="true" />
+  </component>
+  <component name="VcsManagerConfiguration">
+    <MESSAGE value="add rerun config to lm training scripts" />
+    <MESSAGE value="add initial version of gpt2 LM training script to my branch" />
+    <option name="LAST_COMMIT_MESSAGE" value="add initial version of gpt2 LM training script to my branch" />
+  </component>
+</project>
