@@ -9,6 +9,7 @@
 # reevaluate rerun model
 # --fp16
 # --fp16_opt_level 01
+# train new tokenizer!
 
 train_gpt2() {
   python run_clm.py \
