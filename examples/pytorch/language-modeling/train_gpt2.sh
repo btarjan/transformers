@@ -38,32 +38,47 @@ train_file=../../datasets/cc/cc_train_6-0_no-symbols.txt
 test_file=../../datasets/cc/cc_dev_6-0_no-symbols.txt
 
 # training
-batch_size=4
-learning_rate=1e-4
-num_train_epochs=10
-train_gpt2 cc
-
-batch_size=4
-learning_rate=1e-4
-num_train_epochs=20
-train_gpt2 cc
-
-batch_size=1
-learning_rate=1e-4
-num_train_epochs=10
-train_gpt2 cc
-
-batch_size=1
-learning_rate=1e-4
-num_train_epochs=20
-train_gpt2 cc
-
-# Parlament train
-
-#train_file=../../datasets/mtva/MTVA-parlament_8-0_for_CC.txt
-#test_file=../../datasets/cc/cc_dev_6-0_no-symbols.txt
-#
 #batch_size=4
 #learning_rate=1e-4
 #num_train_epochs=10
-#train_gpt2 parl
+#train_gpt2 cc
+#
+#batch_size=4
+#learning_rate=1e-4
+#num_train_epochs=20
+#train_gpt2 cc
+#
+#batch_size=1
+#learning_rate=1e-4
+#num_train_epochs=10
+#train_gpt2 cc
+#
+#batch_size=1
+#learning_rate=1e-4
+#num_train_epochs=20
+#train_gpt2 cc
+
+# Parlament train
+
+train_file=../../datasets/mtva/MTVA-parlament_8-0_for_CC.txt
+test_file=../../datasets/cc/cc_dev_6-0_no-symbols.txt
+
+batch_size=8
+learning_rate=1e-4
+num_train_epochs=5
+train_gpt2 parl
+
+batch_size=8
+learning_rate=1e-4
+num_train_epochs=10
+train_gpt2 parl
+
+batch_size=4
+learning_rate=1e-4
+num_train_epochs=5
+train_gpt2 parl
+
+batch_size=4
+learning_rate=1e-4
+num_train_epochs=10
+train_gpt2 parl
