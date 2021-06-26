@@ -23,7 +23,8 @@ train_gpt2() {
       --evaluation_strategy epoch \
       --validation_file=${test_file} \
       --num_train_epochs ${num_train_epochs} \
-      --save_strategy epoch \
+      --save_strategy steps \
+      --save_steps 1000 \
       --save_total_limit 2 \
       --per_device_train_batch_size ${batch_size} \
       --per_device_eval_batch_size ${batch_size} \
